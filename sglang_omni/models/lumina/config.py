@@ -69,6 +69,10 @@ class LuminaPipelineConfig(UMMPipelineConfig):
             name=ENGINE_STAGE,
             process=ENGINE_STAGE,
             factory_path=f"{PACKAGE}.stages.create_engine_executor",
+            factory=FactoryArgs(
+                # About 33% faster but not token-equal to the eager decoder, and it needs CUDA_HOME.
+                compile_decoder=False,
+            ),
             gpu=0,
             next="orchestrator",
         ),

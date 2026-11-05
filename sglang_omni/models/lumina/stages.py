@@ -64,11 +64,16 @@ def image_output(event: ImageEvent) -> ImageSegment:
 def create_engine_executor(
     model_path: str,
     *,
+    compile_decoder: bool,
     device: str | None = None,
     gpu_id: int | None = None,
 ) -> SimpleScheduler[StagePayload, StagePayload]:
     """One dispatch runs one event, so concurrent requests alternate between events."""
-    runtime = load_lumina_runtime(model_path, resolve_concrete_device(device, gpu_id))
+    runtime = load_lumina_runtime(
+        model_path,
+        resolve_concrete_device(device, gpu_id),
+        compile_decoder=compile_decoder,
+    )
     tokenizer = runtime.processor.tokenizer
     sessions: dict[str, GenerationSession] = {}
 

@@ -6,7 +6,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import torch
-from transformers import DynamicCache
 
 from sglang_omni.models.lumina.attention import event_attention_mask, kept_for_branch
 from sglang_omni.models.lumina.canvas import GenerationPrefix, event_batch
@@ -20,7 +19,8 @@ from sglang_omni.models.lumina.static_memory import StaticMemoryCache
 class BranchKVCache:
     """One branch's compact canonical-prefix KV and the metadata of its slots."""
 
-    past_key_values: DynamicCache
+    past_keys: list[torch.Tensor]
+    past_values: list[torch.Tensor]
     metadata: TokenMetadata
     canonical_indices: torch.Tensor
     attention_masks: dict[TokenRole, torch.Tensor] = field(default_factory=dict)
@@ -96,23 +96,20 @@ class GenerationKVCache:
             prefix, input_ids, indices, branch
         )
         cache_positions = torch.arange(input_ids.shape[1], device=input_ids.device)
-        outputs = self.runtime.model.base_model.language_model(
-            input_ids=None,
+        outputs = self.runtime.model.decode(
+            inputs_embeds=decoder_inputs.inputs_embeds,
             position_ids=event_position_ids[:, :, :prefix_length].index_select(
                 2, indices
             ),
             attention_mask=event_attention_mask(
                 metadata, metadata, cache_positions.unsqueeze(0), branch=branch
             ),
-            past_key_values=DynamicCache(config=self.runtime.model.base_model.config),
-            use_cache=True,
-            cache_position=cache_positions,
-            inputs_embeds=decoder_inputs.inputs_embeds,
             visual_pos_masks=decoder_inputs.visual_pos_masks,
             deepstack_visual_embeds=decoder_inputs.deepstack_visual_embeds,
         )
         cache = BranchKVCache(
-            past_key_values=outputs.past_key_values,
+            past_keys=outputs.keys,
+            past_values=outputs.values,
             metadata=metadata,
             canonical_indices=indices,
         )
@@ -181,28 +178,24 @@ class GenerationKVCache:
         )
         matches = query_indices.unsqueeze(1) == target_indices.unsqueeze(0)
         output_indices = matches.to(torch.int64).argmax(dim=0)
-        outputs = self.runtime.model.base_model(
-            input_ids=query_ids,
+        outputs = self.runtime.model.decode(
+            inputs_embeds=self.runtime.model.get_input_embeddings()(query_ids),
             position_ids=position_ids.index_select(2, query_indices),
             attention_mask=attention_mask,
-            past_key_values=cache.past_key_values,
-            use_cache=False,
-            cache_position=query_key_indices[0],
-            # note (qiujiawei): gathering rows before the head keeps the full-prefix GEMM shape; a shorter one changes BF16 logits.
-            logits_to_keep=output_indices.view(1, -1),
-            cached_detail_values=(
-                cache.detail_values_by_layer if is_detail_read else None
-            ),
-            cached_detail_source_indices=(
+            past_keys=cache.past_keys,
+            past_values=cache.past_values,
+            detail_values=(cache.detail_values_by_layer if is_detail_read else None),
+            detail_source_indices=(
                 cache.detail_source_indices if is_detail_read else None
             ),
-            cached_detail_active=(
+            detail_active=(
                 query_metadata.token_roles == int(TokenRole.IMAGE_TARGET)
                 if is_detail_read
                 else None
             ),
         )
-        return outputs.logits
+        # note (qiujiawei): selecting rows before the head keeps the reference's GEMM shape; another shape changes BF16 logits.
+        return self.runtime.model.token_logits(outputs.hidden_states, output_indices)
 
     def append_clean_branch(
         self,
@@ -244,8 +237,8 @@ class GenerationKVCache:
         decoder_inputs = self.static_memory.decoder_inputs(
             current, query_ids, canonical_suffix, branch
         )
-        outputs = self.runtime.model.base_model.language_model(
-            input_ids=None,
+        outputs = self.runtime.model.decode(
+            inputs_embeds=decoder_inputs.inputs_embeds,
             position_ids=query_positions,
             attention_mask=event_attention_mask(
                 query_metadata,
@@ -253,14 +246,13 @@ class GenerationKVCache:
                 cache_positions.view(1, -1),
                 branch=branch,
             ),
-            past_key_values=cache.past_key_values,
-            use_cache=True,
-            cache_position=cache_positions,
-            inputs_embeds=decoder_inputs.inputs_embeds,
+            past_keys=cache.past_keys,
+            past_values=cache.past_values,
             visual_pos_masks=decoder_inputs.visual_pos_masks,
             deepstack_visual_embeds=decoder_inputs.deepstack_visual_embeds,
         )
-        cache.past_key_values = outputs.past_key_values
+        cache.past_keys = outputs.keys
+        cache.past_values = outputs.values
         cache.metadata = key_metadata
         cache.canonical_indices = torch.cat((cache.canonical_indices, canonical_suffix))
 

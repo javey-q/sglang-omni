@@ -4,83 +4,48 @@
 from __future__ import annotations
 
 import json
-import types
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch._inductor.config as inductor_config
+import torch.nn.functional as F
 from PIL import Image
 from safetensors.torch import load_file
 from torch import nn
-from transformers import AutoProcessor, DynamicCache, ProcessorMixin
+from transformers import AutoProcessor, ProcessorMixin
 
 from sglang_omni.models.lumina.contracts import GENERATED_GRID_FACTOR, TokenRegistry
+from sglang_omni.models.lumina.decoder import (
+    DetailRead,
+    LayerConstants,
+    LayerWeights,
+    decoder_layer_forward,
+    rms_norm,
+)
 from sglang_omni.models.lumina.detail import (
     AdaptiveDetailResampler,
     DetailLayer,
-    PostNormQueryCapture,
     StaticDetailMemory,
 )
-from sglang_omni.vendor.bard_vl.modeling_bard_vl import (
-    BardVLForConditionalGeneration,
-    BardVLTextDecoderLayer,
-)
+from sglang_omni.vendor.bard_vl.modeling_bard_vl import BardVLForConditionalGeneration
 from sglang_omni.vendor.insight_tok.insight_tok import InsightTok
 
 INSIGHT_TOK_CODEBOOK_SIZE = 16384
 INSIGHT_TOK_CODE_CHANNELS = 256
 SUPPORTED_INPUT_IMAGE_ATTENTION = "full_within_image"
+# Real proportions: compiled graphs also guard on how queries compare with keys.
+WARM_UP_PREFIX_LENGTHS = (64, 512)
+WARM_UP_TEXT_LENGTHS = (1, 4)
+WARM_UP_IMAGE_LENGTHS = (65, 193)
 
 
-def decoder_forward(
-    self: BardVLTextDecoderLayer,
-    hidden_states: torch.Tensor,
-    position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    attention_mask: torch.Tensor | None = None,
-    position_ids: torch.Tensor | None = None,
-    past_key_values: DynamicCache | None = None,
-    use_cache: bool | None = False,
-    cache_position: torch.Tensor | None = None,
-    cached_detail_values: tuple[torch.Tensor | None, ...] | None = None,
-    cached_detail_source_indices: torch.Tensor | None = None,
-    cached_detail_active: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """The decoder layer with the Detail residual after self attention."""
-    is_detail_active = self.detail is not None and cached_detail_values is not None
-    if is_detail_active:
-        self.detail_query_capture.begin()
-    else:
-        pass
-    attended, _ = self.self_attn(
-        hidden_states=self.input_layernorm(hidden_states),
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        use_cache=use_cache,
-        cache_position=cache_position,
-        position_embeddings=position_embeddings,
-    )
-    hidden_semantic = hidden_states + attended
-    if is_detail_active:
-        layer_index = self.detail_layer_index
-        source_key = past_key_values.layers[layer_index].keys
-        source_key = source_key.index_select(
-            -2, cached_detail_source_indices.to(source_key.device)
-        )
-        hidden_semantic = hidden_semantic + self.detail(
-            query_post_rope=self.detail_query_capture.finish(position_embeddings),
-            source_key_post_rope=source_key,
-            source_values=cached_detail_values[layer_index].to(
-                source_key.device, source_key.dtype
-            ),
-            hidden_semantic=hidden_semantic,
-            active=cached_detail_active,
-        )
-    else:
-        pass
-    output = self.mlp(self.post_attention_layernorm(hidden_semantic))
-    return hidden_semantic + output
+@dataclass(frozen=True)
+class DecoderOutput:
+    hidden_states: torch.Tensor
+    keys: list[torch.Tensor]
+    values: list[torch.Tensor]
 
 
 class LuminaModel(nn.Module):
@@ -109,10 +74,19 @@ class LuminaModel(nn.Module):
                         device=embedding.device, dtype=embedding.dtype
                     ),
                 )
-                layer.detail_query_capture = PostNormQueryCapture(layer.self_attn)
             else:
                 layer.add_module("detail", None)
-            layer.forward = types.MethodType(decoder_forward, layer)
+        self.layer_weights = [
+            LayerWeights.from_layer(layer) for layer in self.decoder_layers
+        ]
+        self.layer_forward = decoder_layer_forward
+        attention = self.decoder_layers[0].self_attn
+        self.layer_constants = LayerConstants(
+            head_dim=attention.head_dim,
+            key_value_groups=attention.num_key_value_groups,
+            attention_scale=attention.scaling,
+            norm_epsilon=self.decoder_layers[0].input_layernorm.variance_epsilon,
+        )
 
     @property
     def decoder_layers(self) -> nn.ModuleList:
@@ -120,6 +94,130 @@ class LuminaModel(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.base_model.get_input_embeddings()
+
+    def decode(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        past_keys: list[torch.Tensor] | None = None,
+        past_values: list[torch.Tensor] | None = None,
+        visual_pos_masks: torch.Tensor | None = None,
+        deepstack_visual_embeds: list[torch.Tensor] | None = None,
+        detail_values: tuple[torch.Tensor | None, ...] | None = None,
+        detail_source_indices: torch.Tensor | None = None,
+        detail_active: torch.Tensor | None = None,
+    ) -> DecoderOutput:
+        """Run the stack; each layer's K and V come back with its past tokens first."""
+        cos, sin = self.base_model.language_model.rotary_emb(
+            inputs_embeds, position_ids
+        )
+        hidden_states = inputs_embeds
+        keys: list[torch.Tensor] = []
+        values: list[torch.Tensor] = []
+        for layer_index, weights in enumerate(self.layer_weights):
+            source_values = (
+                None if detail_values is None else detail_values[layer_index]
+            )
+            hidden_states, key, value = self.layer_forward(
+                weights,
+                self.layer_constants,
+                hidden_states,
+                cos,
+                sin,
+                attention_mask,
+                None if past_keys is None else past_keys[layer_index],
+                None if past_values is None else past_values[layer_index],
+                (
+                    None
+                    if source_values is None
+                    else DetailRead(
+                        self.decoder_layers[layer_index].detail,
+                        source_values,
+                        detail_source_indices,
+                        detail_active,
+                    )
+                ),
+            )
+            keys.append(key)
+            values.append(value)
+            if deepstack_visual_embeds is not None and layer_index < len(
+                deepstack_visual_embeds
+            ):
+                hidden_states[visual_pos_masks, :] = (
+                    hidden_states[visual_pos_masks, :]
+                    + deepstack_visual_embeds[layer_index]
+                )
+            else:
+                pass
+        return DecoderOutput(hidden_states, keys, values)
+
+    @torch.inference_mode()
+    def enable_compiled_decoder(self) -> None:
+        """Compile the layer function and every path through it before any request.
+
+        Compiling here also makes a broken CUDA toolchain fail at startup rather than on the first request.
+        """
+        # note (qiujiawei): weights are inputs of the layer function, so all layers share one graph per path.
+        inductor_config.emulate_precision_casts = True
+        self.layer_forward = torch.compile(decoder_layer_forward, dynamic=True)
+        weight = self.get_input_embeddings().weight
+
+        def run(
+            length: int,
+            past: DecoderOutput | None,
+            detail_values: tuple[torch.Tensor | None, ...] | None = None,
+            detail_source_indices: torch.Tensor | None = None,
+        ) -> DecoderOutput:
+            past_length = 0 if past is None else past.keys[0].shape[-2]
+            positions = torch.arange(past_length, past_length + length).to(
+                weight.device
+            )
+            return self.decode(
+                inputs_embeds=weight.new_zeros((1, length, weight.shape[1])),
+                position_ids=positions.view(1, 1, -1).expand(3, 1, -1),
+                attention_mask=torch.ones(
+                    (1, 1, length, past_length + length),
+                    dtype=torch.bool,
+                    device=weight.device,
+                ),
+                past_keys=None if past is None else past.keys,
+                past_values=None if past is None else past.values,
+                detail_values=detail_values,
+                detail_source_indices=detail_source_indices,
+                detail_active=(
+                    None
+                    if detail_values is None
+                    else torch.ones((1, length), dtype=torch.bool, device=weight.device)
+                ),
+            )
+
+        for prefix_length in WARM_UP_PREFIX_LENGTHS:
+            prefill = run(prefix_length, None)
+            for length in (*WARM_UP_TEXT_LENGTHS, *WARM_UP_IMAGE_LENGTHS):
+                run(length, prefill)
+            source_indices = torch.arange(prefix_length // 2, device=weight.device)
+            detail_values = tuple(
+                None if layer.detail is None else value.index_select(2, source_indices)
+                for layer, value in zip(
+                    self.decoder_layers, prefill.values, strict=True
+                )
+            )
+            for length in WARM_UP_IMAGE_LENGTHS:
+                run(length, prefill, detail_values, source_indices)
+
+    def token_logits(
+        self, hidden_states: torch.Tensor, output_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Project the chosen rows; the head's input shape decides BF16 rounding."""
+        normalized = rms_norm(
+            hidden_states,
+            self.base_model.language_model.norm.weight,
+            self.layer_constants.norm_epsilon,
+        )
+        selected = normalized.index_select(1, output_indices)
+        return F.linear(selected, self.base_model.lm_head.weight)
 
     def detail_base(
         self,
@@ -227,7 +325,9 @@ class LuminaRuntime:
         return Image.fromarray(pixels.squeeze(0).permute(1, 2, 0).numpy())
 
 
-def load_lumina_runtime(model_path: str, device: torch.device) -> LuminaRuntime:
+def load_lumina_runtime(
+    model_path: str, device: torch.device, *, compile_decoder: bool
+) -> LuminaRuntime:
     """Load one exported Lumina directory and pin the process-wide numerics it needs."""
     model_directory = Path(model_path)
     # note (qiujiawei): torch's cuDNN SDPA is not reproducible here; multi-image turns differ even within one process.
@@ -266,6 +366,10 @@ def load_lumina_runtime(model_path: str, device: torch.device) -> LuminaRuntime:
     else:
         pass
     model.eval()
+    if compile_decoder:
+        model.enable_compiled_decoder()
+    else:
+        pass
     insight_tok = InsightTok(
         dd_config_key="default",
         codebook_size=INSIGHT_TOK_CODEBOOK_SIZE,

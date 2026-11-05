@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang_omni.vendor.bard_vl.configuration_bard_vl import BardVLTextConfig
-from sglang_omni.vendor.bard_vl.modeling_bard_vl import BardVLTextAttention
 
 
 @dataclass(frozen=True)
@@ -78,52 +77,6 @@ class AdaptiveDetailResampler(nn.Module):
         return projected + self.scale_projection(scale).to(projected.dtype)
 
 
-def rotate_half(hidden_states: torch.Tensor) -> torch.Tensor:
-    first, second = hidden_states.chunk(2, dim=-1)
-    return torch.cat((-second, first), dim=-1)
-
-
-def apply_mrope(
-    query: torch.Tensor,
-    position_embeddings: tuple[torch.Tensor, torch.Tensor],
-) -> torch.Tensor:
-    """Apply the decoder's MRoPE broadcast to normalized Q projections."""
-    cos, sin = position_embeddings
-    return (query * cos.unsqueeze(1)) + (rotate_half(query) * sin.unsqueeze(1))
-
-
-class PostNormQueryCapture:
-    """Call-scoped capture of the normalized Q of the main attention."""
-
-    def __init__(self, attention: BardVLTextAttention) -> None:
-        self.is_active = False
-        self.query: torch.Tensor | None = None
-        attention.q_norm.register_forward_hook(self.capture_query)
-
-    def capture_query(
-        self,
-        module: nn.Module,
-        inputs: tuple[torch.Tensor, ...],
-        output: torch.Tensor,
-    ) -> None:
-        if self.is_active:
-            self.query = output
-        else:
-            pass
-
-    def begin(self) -> None:
-        self.is_active = True
-
-    def finish(
-        self, position_embeddings: tuple[torch.Tensor, torch.Tensor]
-    ) -> torch.Tensor:
-        assert self.query is not None
-        query = self.query.transpose(1, 2)
-        self.is_active = False
-        self.query = None
-        return apply_mrope(query, position_embeddings)
-
-
 class DetailLayer(nn.Module):
     """Post-MRoPE read of a source image's Detail values, as a gated residual."""
 
@@ -132,6 +85,9 @@ class DetailLayer(nn.Module):
         hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
+        self.uses_grouped_keys = (
+            config.num_attention_heads != config.num_key_value_heads
+        )
         self.head_dim = config.head_dim
         self.scaling = self.head_dim**-0.5
         self.detail_norm = nn.LayerNorm(hidden_size, eps=1e-6)
@@ -166,7 +122,7 @@ class DetailLayer(nn.Module):
             source_key_post_rope,
             source_values,
             scale=self.scaling,
-            enable_gqa=query_post_rope.shape[1] != source_key_post_rope.shape[1],
+            enable_gqa=self.uses_grouped_keys,
         )
         attended = (
             attended.transpose(1, 2)

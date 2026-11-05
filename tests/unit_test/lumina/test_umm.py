@@ -266,9 +266,11 @@ class EngineHarness:
                 pass
             return session
 
-        monkeypatch.setattr(stages, "load_lumina_runtime", lambda *_: runtime)
+        monkeypatch.setattr(stages, "load_lumina_runtime", lambda *_, **__: runtime)
         monkeypatch.setattr(stages, "start_session", start_session)
-        self.scheduler = stages.create_engine_executor("model", device="cpu")
+        self.scheduler = stages.create_engine_executor(
+            "model", compile_decoder=False, device="cpu"
+        )
         self.loop = asyncio.new_event_loop()
 
     def dispatch(self, request_id: str = "request") -> dict[str, object] | None:
