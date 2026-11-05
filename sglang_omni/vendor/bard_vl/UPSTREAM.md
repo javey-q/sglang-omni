@@ -27,6 +27,8 @@ Each change is marked with a `transformers>=5` comment at the call site.
 - `create_causal_mask`: `input_embeds` becomes `inputs_embeds`, and `cache_position` is no longer a parameter.
 - `BardVLPreTrainedModel._init_weights` is new, and `dim` and `theta` stay on `BardVLVisionRotaryEmbedding`. transformers 5.x builds the model on the meta device and only materializes tensors the checkpoint provides or `_init_weights` handles. Without this the vision `inv_freq` stays on meta and reads back as zeros, and the vision tower silently loses all positional information. It mirrors `Qwen3VLPreTrainedModel._init_weights` in transformers 5.12.
 
+- `BardVLTextModel.forward` and `BardVLModel.forward` document `cache_position`, because transformers 5.x logs an error at import for an undocumented argument.
+
 Beyond these, the files only went through this repository's formatters, black, isort, and autoflake.
 
 ## Bumping transformers

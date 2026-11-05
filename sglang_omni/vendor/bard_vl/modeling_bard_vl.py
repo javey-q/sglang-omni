@@ -992,6 +992,8 @@ class BardVLTextModel(BardVLPreTrainedModel):
             The deepstack visual embeddings. The shape is (num_layers, visual_seqlen, embed_dim).
             The feature is extracted from the different visual encoder layers, and fed to the decoder
             hidden states. It's from the paper DeepStack(https://arxiv.org/abs/2406.04334).
+        cache_position (`torch.LongTensor`, *optional*):
+            Indices of the input tokens in the cache.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -1414,6 +1416,8 @@ class BardVLModel(BardVLPreTrainedModel):
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
             The temporal, height and width of feature shape of each video in LLM.
+        cache_position (`torch.LongTensor`, *optional*):
+            Indices of the input tokens in the cache.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
