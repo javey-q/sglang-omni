@@ -125,10 +125,11 @@ class LuminaUMMAdapter:
             outputs = (UMMOutput("text", output["text"]),)
         else:
             outputs = (UMMOutput("image", output),)
-        if result["done"]:
-            return UMMStep(outputs=outputs)
-        else:
+        finish_reason = result["finish_reason"]
+        if finish_reason is None:
             return UMMStep(outputs=outputs, dispatches=(event_dispatch(context, {}),))
+        else:
+            return UMMStep(outputs=outputs, finish_reason=finish_reason)
 
     def usage(self, context: UMMContext) -> int:
         return 0

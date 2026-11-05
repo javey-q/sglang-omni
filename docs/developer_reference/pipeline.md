@@ -166,6 +166,8 @@ running phase work, and the request closes once with reason `shed`, just as a
 request that reaches its deadline fails with the `timeout_s` error (HTTP 500)
 and closes with reason `expired`.
 
+The step that completes a request names its `finish_reason`. The default is `stop`. An adapter whose budget ended the answer early sets `length`, which the client receives on the final response and on the last stream chunk.
+
 A step can also list phases in `dispatches` to run them at once, at most one per stage of a request. A step that starts no phase waits while others run, and `advance` reports each result as it returns, so an adapter whose phases finish out of order holds its outputs to publish them in model order.
 
 A pipeline config subclasses `UMMPipelineConfig` and declares an

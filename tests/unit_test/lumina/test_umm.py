@@ -10,6 +10,7 @@ from PIL import Image
 from sglang_omni.models.lumina import stages
 from sglang_omni.models.lumina.config import LuminaPipelineConfig
 from sglang_omni.models.lumina.generation import (
+    EndEvent,
     IncompleteInterleavedGenerationError,
     IncompleteTextGenerationError,
     TextEvent,
@@ -99,7 +100,7 @@ def test_later_events_carry_no_inputs_and_segments_keep_their_kind() -> None:
     step = adapter.advance(
         context,
         EVENT,
-        {"output": {"kind": "text", "text": "A cat."}, "done": False},
+        {"output": {"kind": "text", "text": "A cat."}, "finish_reason": None},
     )
     assert [(output.kind, output.data) for output in step.outputs] == [
         ("text", "A cat.")
@@ -107,17 +108,21 @@ def test_later_events_carry_no_inputs_and_segments_keep_their_kind() -> None:
     assert step.dispatches[0].request.inputs == {}
 
     image = {"kind": "image", "url": "data:image/png;base64,AAAA"}
-    step = adapter.advance(context, EVENT, {"output": image, "done": False})
+    step = adapter.advance(context, EVENT, {"output": image, "finish_reason": None})
     assert [(output.kind, output.data) for output in step.outputs] == [("image", image)]
 
 
-def test_done_completes_without_a_dispatch_and_empty_text_emits_nothing() -> None:
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+def test_a_finished_event_completes_with_its_reason_and_empty_text_emits_nothing(
+    finish_reason: str,
+) -> None:
     adapter = LuminaUMMAdapter("model")
     context = context_for(USER_TURN)
-    assert (
-        adapter.advance(context, EVENT, {"output": None, "done": True}).dispatches == ()
-    )
-    empty = {"output": {"kind": "text", "text": ""}, "done": True}
+    finished = {"output": None, "finish_reason": finish_reason}
+    step = adapter.advance(context, EVENT, finished)
+    assert step.dispatches == ()
+    assert step.finish_reason == finish_reason
+    empty = {"output": {"kind": "text", "text": ""}, "finish_reason": finish_reason}
     assert adapter.advance(context, EVENT, empty).outputs == ()
 
 
@@ -218,11 +223,13 @@ def test_preprocess_rejects_parts_the_model_cannot_read() -> None:
 class ScriptedSession:
     """Plays back one outcome per step; an exception stands for the engine raising it."""
 
-    def __init__(self, outcomes: list[TextEvent | Exception]) -> None:
+    def __init__(
+        self, outcomes: list[TextEvent | EndEvent | Exception], *, is_exhausted: bool
+    ) -> None:
         self.outcomes = outcomes
-        self.is_exhausted = False
+        self.is_exhausted = is_exhausted
 
-    def step(self) -> TextEvent:
+    def step(self) -> TextEvent | EndEvent:
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -236,7 +243,9 @@ class EngineHarness:
     def __init__(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        scripts: list[list[TextEvent | Exception]],
+        scripts: list[list[TextEvent | EndEvent | Exception]],
+        *,
+        is_exhausted: bool = False,
     ) -> None:
         tokenizer = SimpleNamespace(
             decode=lambda token_ids, skip_special_tokens: f"decoded{token_ids}"
@@ -247,7 +256,9 @@ class EngineHarness:
         self.scripts = scripts
 
         def start_session(unused_runtime: object, inputs: object) -> ScriptedSession:
-            session = ScriptedSession(self.scripts[self.started])
+            session = ScriptedSession(
+                self.scripts[self.started], is_exhausted=is_exhausted
+            )
             self.started += 1
             if self.on_start is not None:
                 self.on_start()
@@ -284,7 +295,7 @@ def test_events_of_one_request_share_a_session_until_it_ends(
         ],
     )
     assert harness.dispatch()["output"] == {"kind": "text", "text": "decoded[1]"}
-    assert harness.dispatch() == {"output": None, "done": True}
+    assert harness.dispatch() == {"output": None, "finish_reason": "length"}
     assert harness.started == 1
     harness.dispatch()
     assert harness.started == 2
@@ -297,7 +308,20 @@ def test_truncated_text_still_reaches_the_client_and_ends_the_turn(
     harness = EngineHarness(monkeypatch, [[error]])
     assert harness.dispatch() == {
         "output": {"kind": "text", "text": "decoded[5, 6]"},
-        "done": True,
+        "finish_reason": "length",
+    }
+
+
+def test_the_model_closing_its_turn_stops_and_running_out_of_decisions_is_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exhausting the decisions raises nothing, so it must not read as a closed turn."""
+    closed = EngineHarness(monkeypatch, [[EndEvent()]], is_exhausted=True)
+    assert closed.dispatch() == {"output": None, "finish_reason": "stop"}
+    exhausted = EngineHarness(monkeypatch, [[TextEvent([1])]], is_exhausted=True)
+    assert exhausted.dispatch() == {
+        "output": {"kind": "text", "text": "decoded[1]"},
+        "finish_reason": "length",
     }
 
 

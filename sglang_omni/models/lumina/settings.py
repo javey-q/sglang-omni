@@ -8,6 +8,8 @@ from typing import Literal, TypedDict
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from sglang_omni.pipeline.umm import UMMFinishReason
+
 IMAGE_EDGE_FACTOR = 32
 
 
@@ -51,8 +53,10 @@ class ImageSegment(TypedDict):
 
 
 class EventResult(TypedDict):
+    """One engine dispatch; finish_reason stays None while the turn continues."""
+
     output: TextSegment | ImageSegment | None
-    done: bool
+    finish_reason: UMMFinishReason | None
 
 
 class LuminaGenerationParams(BaseModel):

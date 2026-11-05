@@ -38,6 +38,7 @@ JSONValue: TypeAlias = (
     str | int | float | bool | None | list["JSONValue"] | dict[str, "JSONValue"]
 )
 CloseReason = Literal["completed", "failed", "aborted", "expired", "shed", "shutdown"]
+UMMFinishReason = Literal["stop", "length"]
 # Request metadata key of the Continuation each controller output carries.
 CONTINUATION_METADATA_KEY = "omni_continuation"
 # A phase result reports context it produced under this data key, and the
@@ -98,7 +99,8 @@ class UMMStep:
 
     A step starts the phase it names and every phase in dispatches, at most
     one per phase stage of the request. A step that starts none publishes its
-    outputs and completes the request, or waits while phases of it run.
+    outputs and completes the request, or waits while phases of it run. The
+    step that completes the request names its finish_reason.
     """
 
     phase: str | None = None
@@ -106,6 +108,7 @@ class UMMStep:
     outputs: tuple[UMMOutput, ...] = ()
     context: ContextRef | None = None
     dispatches: tuple[UMMDispatch, ...] = ()
+    finish_reason: UMMFinishReason = "stop"
 
 
 def limit_problems(limits: Mapping[str, object]) -> list[str]:
@@ -640,7 +643,7 @@ class UMMController(
                     )
                     for segment in context.outputs
                 ],
-                "finish_reason": "stop",
+                "finish_reason": step.finish_reason,
             }
             return StagePayload(request_id, request, result), added, {}
         else:

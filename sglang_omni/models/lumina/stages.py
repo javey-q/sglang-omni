@@ -25,6 +25,7 @@ from sglang_omni.models.lumina.settings import (
     LuminaGenerationParams,
     TextSegment,
 )
+from sglang_omni.pipeline.umm import UMMFinishReason
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.device import resolve_concrete_device
@@ -83,29 +84,33 @@ def create_engine_executor(
         else:
             pass
         output: TextSegment | ImageSegment | None = None
+        finish_reason: UMMFinishReason | None = None
         try:
             event = session.step()
-            is_done = isinstance(event, EndEvent) or session.is_exhausted
-            if isinstance(event, ImageEvent):
-                output = image_output(event)
-            elif not isinstance(event, EndEvent):
-                output = decode_text(event.token_ids)
+            if isinstance(event, EndEvent):
+                finish_reason = "stop"
             else:
-                pass
+                output = (
+                    image_output(event)
+                    if isinstance(event, ImageEvent)
+                    else decode_text(event.token_ids)
+                )
+                # The last allowed decision produced an event, so the turn stays open.
+                finish_reason = "length" if session.is_exhausted else None
         except IncompleteTextGenerationError as error:
             logger.info(f"Lumina text truncated for {payload.request_id}: {error}")
-            output, is_done = decode_text(error.token_ids), True
+            output, finish_reason = decode_text(error.token_ids), "length"
         except IncompleteInterleavedGenerationError as error:
             logger.info(f"Lumina turn truncated for {payload.request_id}: {error}")
-            is_done = True
+            finish_reason = "length"
         except Exception:
             sessions.pop(payload.request_id, None)
             raise
-        if is_done:
+        if finish_reason is not None:
             sessions.pop(payload.request_id, None)
         else:
             pass
-        result: EventResult = {"output": output, "done": is_done}
+        result: EventResult = {"output": output, "finish_reason": finish_reason}
         payload.data = result
         return payload
 

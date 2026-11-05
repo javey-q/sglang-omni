@@ -345,6 +345,22 @@ def test_each_execution_shape_completes_with_ordered_segments(
     assert not controller.contexts and not getattr(adapter, "histories", None)
 
 
+class TruncatingAdapter(OneCallAdapter):
+    def advance(self, context, phase, result):
+        step = super().advance(context, phase, result)
+        return replace(step, finish_reason="length")
+
+
+@pytest.mark.parametrize(
+    ("adapter_cls", "expected"),
+    [(OneCallAdapter, "stop"), (TruncatingAdapter, "length")],
+)
+def test_the_completing_step_names_the_finish_reason(adapter_cls, expected):
+    controller = make_controller(adapter_cls(), {"generate": "unified"})
+    result, _ = drive(controller, {"unified": unified}, initial())
+    assert result.data["finish_reason"] == expected
+
+
 def test_stale_duplicate_forged_and_lost_continuations_never_advance():
     adapter = SplitAdapter()
     controller = make_controller(adapter)
