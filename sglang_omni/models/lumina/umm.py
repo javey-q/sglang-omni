@@ -1,0 +1,137 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Lumina on the shared UMM controller: prepare once, then one dispatch per event."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import replace
+
+from pydantic import ValidationError
+
+from sglang_omni.models.lumina.settings import LuminaGenerationParams
+from sglang_omni.pipeline.umm import (
+    CloseReason,
+    UMMContext,
+    UMMDispatch,
+    UMMOutput,
+    UMMRequestError,
+    UMMStep,
+)
+from sglang_omni.proto import OmniRequest
+
+PREPARE = "prepare"
+EVENT = "event"
+
+
+def validate_messages(inputs: object) -> None:
+    """Reject requests the model cannot serve before they reach a stage."""
+    if isinstance(inputs, dict):
+        for key in ("images", "audios", "videos"):
+            if inputs.get(key):
+                raise UMMRequestError(
+                    f"Lumina takes {key} as chat content parts, not as a request field"
+                )
+            else:
+                pass
+        messages = inputs.get("messages")
+    else:
+        messages = inputs
+    if not isinstance(messages, list) or not messages:
+        raise UMMRequestError("Lumina requires chat messages")
+    else:
+        pass
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in (
+            "system",
+            "user",
+            "assistant",
+        ):
+            raise UMMRequestError(
+                "Lumina messages need a system, user, or assistant role"
+            )
+        else:
+            pass
+    if messages[-1]["role"] != "user":
+        raise UMMRequestError("Lumina conversations must end in a user message")
+    elif any(message["role"] == "system" for message in messages[1:]):
+        raise UMMRequestError("Lumina takes a system message only as the first turn")
+    else:
+        pass
+
+
+def generation_params(request: OmniRequest) -> LuminaGenerationParams:
+    """The client's Lumina controls from stage_params.orchestrator."""
+    stage_params = request.params.get("stage_params") or {}
+    options = (
+        stage_params.get("orchestrator", {}) if isinstance(stage_params, dict) else None
+    )
+    if not isinstance(options, dict):
+        raise UMMRequestError("stage_params.orchestrator must be a mapping")
+    else:
+        pass
+    try:
+        return LuminaGenerationParams.model_validate(options)
+    except ValidationError as error:
+        raise UMMRequestError(f"stage_params.orchestrator: {error}") from error
+
+
+def event_dispatch(context: UMMContext, inputs: Mapping[str, object]) -> UMMDispatch:
+    # Only the first event carries the images: the engine keeps the session after it.
+    request = OmniRequest(
+        dict(inputs), context.request.params, context.request.metadata
+    )
+    return UMMDispatch(EVENT, request)
+
+
+class LuminaUMMAdapter:
+    """Keeps no per-request state: the engine owns the session, the controller the outputs."""
+
+    def __init__(self, model_path: str) -> None:
+        # note (qiujiawei): the controller's adapter contract passes the model path; this adapter reads no model files.
+        self.model_path = model_path
+
+    def start(self, context: UMMContext) -> UMMStep:
+        validate_messages(context.request.inputs)
+        params = generation_params(context.request)
+        # Preparation, then at most one dispatch per allowed decision.
+        needed = params.max_events + 2
+        if needed > context.remaining_dispatches:
+            raise UMMRequestError(
+                f"max_events={params.max_events} needs {needed} phases, more than the "
+                f"{context.remaining_dispatches} this deployment allows. Lower "
+                "max_events or raise stages.orchestrator.factory.max_dispatches"
+            )
+        else:
+            pass
+        metadata = {
+            **context.request.metadata,
+            "lumina_generation": params.model_dump(),
+        }
+        return UMMStep(PREPARE, replace(context.request, metadata=metadata))
+
+    def advance(self, context: UMMContext, phase: str, result: object) -> UMMStep:
+        if not isinstance(result, dict):
+            raise ValueError(f"Lumina phase {phase!r} returned no mapping")
+        elif phase == PREPARE:
+            return UMMStep(dispatches=(event_dispatch(context, result),))
+        elif phase != EVENT:
+            raise ValueError(f"Lumina adapter received unexpected phase {phase!r}")
+        else:
+            pass
+        output = result["output"]
+        if output is None or output.get("text") == "":
+            outputs = ()
+        elif output["kind"] == "text":
+            outputs = (UMMOutput("text", output["text"]),)
+        else:
+            outputs = (UMMOutput("image", output),)
+        if result["done"]:
+            return UMMStep(outputs=outputs)
+        else:
+            return UMMStep(outputs=outputs, dispatches=(event_dispatch(context, {}),))
+
+    def usage(self, context: UMMContext) -> int:
+        return 0
+
+    def close(self, context: UMMContext, reason: CloseReason) -> None:
+        pass
