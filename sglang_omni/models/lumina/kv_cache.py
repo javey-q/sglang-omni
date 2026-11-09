@@ -13,6 +13,11 @@ from sglang_omni.models.lumina.contracts import CFGBranch, TokenRole
 from sglang_omni.models.lumina.metadata import TokenMetadata
 from sglang_omni.models.lumina.modeling import LuminaRuntime
 from sglang_omni.models.lumina.static_memory import StaticMemoryCache
+from sglang_omni.models.lumina.target_inputs import (
+    ImageBatch,
+    TargetInputs,
+    stack_image_branches,
+)
 
 
 @dataclass
@@ -39,6 +44,7 @@ class GenerationKVCache:
         self.runtime = runtime
         self.branches: dict[CFGBranch, BranchKVCache] = {}
         self.static_memory = StaticMemoryCache(runtime)
+        self.image_batches: dict[tuple[CFGBranch, ...], ImageBatch] = {}
 
     def attach_branch_detail(
         self, prefix: GenerationPrefix, branch: CFGBranch, cache: BranchKVCache
@@ -128,6 +134,22 @@ class GenerationKVCache:
         width: int | None = None,
     ) -> torch.Tensor:
         """Run only the current block or image against one compact prefix cache."""
+        query_ids, inputs = self.target_inputs(
+            prefix, current_ids, role=role, branch=branch, height=height, width=width
+        )
+        return self.target_logits(query_ids, inputs)
+
+    def target_inputs(
+        self,
+        prefix: GenerationPrefix,
+        current_ids: torch.Tensor,
+        *,
+        role: TokenRole,
+        branch: CFGBranch,
+        height: int | None,
+        width: int | None,
+    ) -> tuple[torch.Tensor, TargetInputs]:
+        """Query ids and the rest of one branch's target forward."""
         input_ids, position_ids, metadata = event_batch(
             prefix, current_ids, role=role, branch=branch, height=height, width=width
         )
@@ -177,9 +199,7 @@ class GenerationKVCache:
             prefix_length, prefix_length + current_ids.numel(), device=input_ids.device
         )
         matches = query_indices.unsqueeze(1) == target_indices.unsqueeze(0)
-        output_indices = matches.to(torch.int64).argmax(dim=0)
-        outputs = self.runtime.model.decode(
-            inputs_embeds=self.runtime.model.get_input_embeddings()(query_ids),
+        inputs = TargetInputs(
             position_ids=position_ids.index_select(2, query_indices),
             attention_mask=attention_mask,
             past_keys=cache.past_keys,
@@ -193,9 +213,86 @@ class GenerationKVCache:
                 if is_detail_read
                 else None
             ),
+            output_indices=matches.to(torch.int64).argmax(dim=0),
+            code_columns=self.image_code_columns(role),
+        )
+        return query_ids, inputs
+
+    def forward_image_branches(
+        self,
+        prefix: GenerationPrefix,
+        current_ids: torch.Tensor,
+        *,
+        branches: tuple[CFGBranch, ...],
+        height: int,
+        width: int,
+    ) -> dict[CFGBranch, torch.Tensor]:
+        """Image-target logits of every CFG branch, batched into one forward with cfg_batch."""
+        if not self.runtime.model.options.cfg_batch or len(branches) == 1:
+            return {
+                branch: self.forward_event(
+                    prefix,
+                    current_ids,
+                    role=TokenRole.IMAGE_TARGET,
+                    branch=branch,
+                    height=height,
+                    width=width,
+                )
+                for branch in branches
+            }
+        else:
+            pass
+        batch = self.image_batches.get(branches)
+        if batch is None:
+            batch = stack_image_branches(
+                branches,
+                [
+                    self.target_inputs(
+                        prefix,
+                        current_ids,
+                        role=TokenRole.IMAGE_TARGET,
+                        branch=branch,
+                        height=height,
+                        width=width,
+                    )
+                    for branch in branches
+                ],
+            )
+            self.image_batches[branches] = batch
+        else:
+            pass
+        # Positions, masks, and the prefix are fixed until the event commits; only canvas ids change.
+        batch.query_ids.index_copy_(
+            1, batch.inputs.output_indices, current_ids.expand(len(branches), -1)
+        )
+        logits = self.target_logits(batch.query_ids, batch.inputs)
+        return {branch: logits[row : row + 1] for row, branch in enumerate(branches)}
+
+    def target_logits(
+        self, query_ids: torch.Tensor, inputs: TargetInputs
+    ) -> torch.Tensor:
+        outputs = self.runtime.model.decode(
+            inputs_embeds=self.runtime.model.get_input_embeddings()(query_ids),
+            position_ids=inputs.position_ids,
+            attention_mask=inputs.attention_mask,
+            past_keys=inputs.past_keys,
+            past_values=inputs.past_values,
+            detail_values=inputs.detail_values,
+            detail_source_indices=inputs.detail_source_indices,
+            detail_active=inputs.detail_active,
         )
         # note (qiujiawei): selecting rows before the head keeps the reference's GEMM shape; another shape changes BF16 logits.
-        return self.runtime.model.token_logits(outputs.hidden_states, output_indices)
+        return self.runtime.model.token_logits(
+            outputs.hidden_states,
+            inputs.output_indices,
+            code_columns=inputs.code_columns,
+        )
+
+    def image_code_columns(self, role: TokenRole) -> bool:
+        """Whether logits of this role cover only the image codes."""
+        return (
+            role == TokenRole.IMAGE_TARGET and self.runtime.model.options.code_lm_head
+        )
 
     def append_clean_branch(
         self,
@@ -260,6 +357,8 @@ class GenerationKVCache:
         self, previous: GenerationPrefix, current: GenerationPrefix
     ) -> None:
         """Append one canonical clean suffix to every materialized branch."""
+        # Stacked batches copy the old prefix; the next image event stacks them again.
+        self.image_batches = {}
         for branch, cache in self.branches.items():
             self.append_clean_branch(previous, current, branch, cache)
 

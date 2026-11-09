@@ -108,8 +108,15 @@ def sample_image_tokens(
     temperature: float,
     top_p: float,
     generator: torch.Generator,
+    code_columns: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    flat = registry.apply_role_mask(logits, OutputRole.IMAGE_SPAN).float()
+    """Sample token ids; code-column logits hold exactly the codes the role mask allows."""
+    if code_columns:
+        flat = logits.float()
+        offset = registry.code_start_id
+    else:
+        flat = registry.apply_role_mask(logits, OutputRole.IMAGE_SPAN).float()
+        offset = 0
     scaled = flat.reshape(-1, flat.shape[-1]) / temperature
     ordered, indices = scaled.sort(descending=True)
     cumulative = ordered.softmax(-1).cumsum(-1)
@@ -122,7 +129,7 @@ def sample_image_tokens(
     sampled = torch.multinomial(distribution, 1, generator=generator)
     probabilities = distribution.gather(-1, sampled)
     shape = logits.shape[:-1]
-    return sampled.view(shape), probabilities.view(shape)
+    return (sampled + offset).view(shape), probabilities.view(shape)
 
 
 def mask_premature_text_align(
@@ -180,17 +187,9 @@ def generate_image_codes(
             break
         else:
             pass
-        branch_logits = {
-            branch: kv_cache.forward_event(
-                prefix,
-                current,
-                role=TokenRole.IMAGE_TARGET,
-                branch=branch,
-                height=height,
-                width=width,
-            )
-            for branch in required
-        }
+        branch_logits = kv_cache.forward_image_branches(
+            prefix, current, branches=required, height=height, width=width
+        )
         logits = combine_cfg_logits(
             branch_logits, g_text=params.g_text, g_image=params.g_image
         )
@@ -200,6 +199,7 @@ def generate_image_codes(
             temperature=params.image_temperature,
             top_p=params.top_p,
             generator=generator,
+            code_columns=kv_cache.image_code_columns(TokenRole.IMAGE_TARGET),
         )
         scheduled = scheduled_image_transfer_count(
             int(active.sum().item()), step=step, total_steps=params.image_steps

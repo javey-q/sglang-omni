@@ -70,8 +70,16 @@ class LuminaPipelineConfig(UMMPipelineConfig):
             process=ENGINE_STAGE,
             factory_path=f"{PACKAGE}.stages.create_engine_executor",
             factory=FactoryArgs(
-                # About 33% faster but not token-equal to the eager decoder, and it needs CUDA_HOME.
+                # torch.compile of the decoder; it needs fused_rope and fused_rmsnorm off and is slower than them.
                 compile_decoder=False,
+                # Image logits over the 16384 code columns only, which the role mask allows anyway.
+                code_lm_head=True,
+                # SGLang's bit-exact rotate-half RoPE kernel.
+                fused_rope=True,
+                # SGLang's RMSNorm kernel, built at startup with CUDA_HOME and ninja.
+                fused_rmsnorm=True,
+                # The CFG branches of an image step in one padded forward.
+                cfg_batch=True,
             ),
             gpu=0,
             next="orchestrator",

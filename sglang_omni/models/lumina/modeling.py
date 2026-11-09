@@ -22,7 +22,7 @@ from sglang_omni.models.lumina.decoder import (
     LayerConstants,
     LayerWeights,
     decoder_layer_forward,
-    rms_norm,
+    layer_rms_norm,
 )
 from sglang_omni.models.lumina.detail import (
     AdaptiveDetailResampler,
@@ -41,6 +41,18 @@ WARM_UP_TEXT_LENGTHS = (1, 4)
 WARM_UP_IMAGE_LENGTHS = (65, 193)
 
 
+@dataclass(frozen=True, kw_only=True)
+class DecoderOptions:
+    """Speedups of the plain decoder; with all of them off it stays bitwise equal to the vendored one."""
+
+    # Image logits over the code columns only: the role mask allows nothing else, so only rounding changes.
+    code_lm_head: bool = False
+    fused_rope: bool = False
+    fused_rmsnorm: bool = False
+    # All CFG branches of an image step in one padded forward.
+    cfg_batch: bool = False
+
+
 @dataclass(frozen=True)
 class DecoderOutput:
     hidden_states: torch.Tensor
@@ -57,10 +69,12 @@ class LuminaModel(nn.Module):
         *,
         registry: TokenRegistry,
         detail_start_layer: int,
+        options: DecoderOptions,
     ) -> None:
         super().__init__()
         self.base_model = base_model
         self.registry = registry
+        self.options = options
         embedding = base_model.get_input_embeddings().weight
         self.detail_resampler = AdaptiveDetailResampler(embedding.shape[1])
         self.detail_resampler.to(device=embedding.device, dtype=embedding.dtype)
@@ -86,7 +100,13 @@ class LuminaModel(nn.Module):
             key_value_groups=attention.num_key_value_groups,
             attention_scale=attention.scaling,
             norm_epsilon=self.decoder_layers[0].input_layernorm.variance_epsilon,
+            fused_rope=options.fused_rope,
+            fused_rmsnorm=options.fused_rmsnorm,
         )
+        head = base_model.lm_head.weight
+        self.code_head_weight = head.detach()[
+            registry.code_start_id : registry.code_end_id + 1
+        ]
 
     @property
     def decoder_layers(self) -> nn.ModuleList:
@@ -161,6 +181,8 @@ class LuminaModel(nn.Module):
         """
         # note (qiujiawei): weights are inputs of the layer function, so all layers share one graph per path.
         inductor_config.emulate_precision_casts = True
+        # Autotuning times reduction block sizes, and the size changes rounding between fresh caches. Dynamo resets inductor_config.deterministic after every frame, so it cannot pin them.
+        inductor_config.test_configs.force_filter_reduction_configs = True
         self.layer_forward = torch.compile(decoder_layer_forward, dynamic=True)
         weight = self.get_input_embeddings().weight
 
@@ -208,16 +230,26 @@ class LuminaModel(nn.Module):
                 run(length, prefill, detail_values, source_indices)
 
     def token_logits(
-        self, hidden_states: torch.Tensor, output_indices: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        output_indices: torch.Tensor,
+        *,
+        code_columns: bool,
     ) -> torch.Tensor:
-        """Project the chosen rows; the head's input shape decides BF16 rounding."""
-        normalized = rms_norm(
+        """Project the chosen rows; the head's input shape decides BF16 rounding.
+
+        With code_columns the logits cover only the image codes, column 0 being the first code.
+        """
+        normalized = layer_rms_norm(
+            self.layer_constants,
             hidden_states,
             self.base_model.language_model.norm.weight,
-            self.layer_constants.norm_epsilon,
         )
         selected = normalized.index_select(1, output_indices)
-        return F.linear(selected, self.base_model.lm_head.weight)
+        weight = (
+            self.code_head_weight if code_columns else self.base_model.lm_head.weight
+        )
+        return F.linear(selected, weight)
 
     def detail_base(
         self,
@@ -326,9 +358,19 @@ class LuminaRuntime:
 
 
 def load_lumina_runtime(
-    model_path: str, device: torch.device, *, compile_decoder: bool
+    model_path: str,
+    device: torch.device,
+    *,
+    compile_decoder: bool,
+    options: DecoderOptions,
 ) -> LuminaRuntime:
     """Load one exported Lumina directory and pin the process-wide numerics it needs."""
+    if compile_decoder and (options.fused_rope or options.fused_rmsnorm):
+        raise ValueError(
+            "compile_decoder fuses RoPE and RMSNorm itself; turn off fused_rope and fused_rmsnorm"
+        )
+    else:
+        pass
     model_directory = Path(model_path)
     # note (qiujiawei): torch's cuDNN SDPA is not reproducible here; multi-image turns differ even within one process.
     torch.backends.cuda.enable_cudnn_sdp(False)
@@ -349,6 +391,7 @@ def load_lumina_runtime(
         base_model,
         registry=TokenRegistry(),
         detail_start_layer=lumina_config["detail_start_layer"],
+        options=options,
     ).to(device)
     detail_state = load_file(model_directory / "detail.safetensors", device=str(device))
     loaded = model.load_state_dict(detail_state, strict=False)

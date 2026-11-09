@@ -5,6 +5,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+import torch
 from PIL import Image
 
 from sglang_omni.models.lumina import stages
@@ -15,6 +16,7 @@ from sglang_omni.models.lumina.generation import (
     IncompleteTextGenerationError,
     TextEvent,
 )
+from sglang_omni.models.lumina.modeling import DecoderOptions
 from sglang_omni.models.lumina.preprocessor import (
     canonical_image,
     preprocess,
@@ -132,6 +134,31 @@ def test_default_budget_fits_the_default_limits() -> None:
     default_events = LuminaGenerationParams().max_events
     assert controller.factory.max_dispatches == default_events + 2
     assert controller.factory.max_outputs == default_events + 1
+
+
+def test_engine_switches_of_the_config_reach_the_decoder_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = LuminaPipelineConfig(model_path="model")
+    switches = config.stage_named("engine").factory.model_extra
+    loaded: list[DecoderOptions] = []
+
+    def load_runtime(
+        model_path: str,
+        device: torch.device,
+        *,
+        compile_decoder: bool,
+        options: DecoderOptions,
+    ) -> SimpleNamespace:
+        loaded.append(options)
+        return SimpleNamespace(processor=SimpleNamespace(tokenizer=None))
+
+    monkeypatch.setattr(stages, "load_lumina_runtime", load_runtime)
+    stages.create_engine_executor("model", **switches, device="cpu")
+    options = {
+        name: value for name, value in switches.items() if name != "compile_decoder"
+    }
+    assert loaded == [DecoderOptions(**options)]
 
 
 @pytest.mark.parametrize(
@@ -268,8 +295,9 @@ class EngineHarness:
 
         monkeypatch.setattr(stages, "load_lumina_runtime", lambda *_, **__: runtime)
         monkeypatch.setattr(stages, "start_session", start_session)
+        engine = LuminaPipelineConfig(model_path="model").stage_named("engine")
         self.scheduler = stages.create_engine_executor(
-            "model", compile_decoder=False, device="cpu"
+            "model", **engine.factory.model_extra, device="cpu"
         )
         self.loop = asyncio.new_event_loop()
 

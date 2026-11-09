@@ -11,6 +11,10 @@ from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
+from sglang.kernels.ops.diffusion.rope.rope_rotate_half_bitexact import (
+    fused_rope_rotate_half_bitexact,
+)
+from sglang.kernels.ops.layernorm.rmsnorm_hf import rmsnorm_hf
 
 from sglang_omni.models.lumina.detail import DetailLayer
 from sglang_omni.vendor.bard_vl.modeling_bard_vl import BardVLTextDecoderLayer
@@ -65,6 +69,10 @@ class LayerConstants:
     key_value_groups: int
     attention_scale: float
     norm_epsilon: float
+    # One Triton kernel for each rotary embedding, bit-exact with the eager chain.
+    fused_rope: bool = False
+    # One kernel for each RMSNorm; its FP32 sum order differs from the eager mean.
+    fused_rmsnorm: bool = False
 
 
 class DetailRead(NamedTuple):
@@ -85,9 +93,44 @@ def rms_norm(
     return weight * normalized.to(hidden_states.dtype)
 
 
+def fused_rms_norm(
+    hidden_states: torch.Tensor, weight: torch.Tensor, epsilon: float
+) -> torch.Tensor:
+    shape = hidden_states.shape
+    return rmsnorm_hf(hidden_states.reshape(-1, shape[-1]), weight, epsilon).view(shape)
+
+
+def layer_rms_norm(
+    constants: LayerConstants, hidden_states: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    if constants.fused_rmsnorm:
+        return fused_rms_norm(hidden_states, weight, constants.norm_epsilon)
+    else:
+        return rms_norm(hidden_states, weight, constants.norm_epsilon)
+
+
 def rotate_half(hidden_states: torch.Tensor) -> torch.Tensor:
     first, second = hidden_states.chunk(2, dim=-1)
     return torch.cat((-second, first), dim=-1)
+
+
+def apply_rope(
+    constants: LayerConstants,
+    heads: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Rotate [batch, length, heads, head_dim] activations; returns [batch, heads, length, head_dim]."""
+    if constants.fused_rope:
+        table_shape = (-1, cos.shape[-1])
+        return fused_rope_rotate_half_bitexact(
+            heads, cos.reshape(table_shape), sin.reshape(table_shape)
+        ).transpose(1, 2)
+    else:
+        heads = heads.transpose(1, 2)
+        head_cos = cos.unsqueeze(1)
+        head_sin = sin.unsqueeze(1)
+        return (heads * head_cos) + (rotate_half(heads) * head_sin)
 
 
 def decoder_layer_forward(
@@ -104,23 +147,28 @@ def decoder_layer_forward(
     """Return the layer's hidden states and its full K and V, past tokens first."""
     batch_size, length = hidden_states.shape[:2]
     head_shape = (batch_size, length, -1, constants.head_dim)
-    normalized = rms_norm(hidden_states, weights.input_norm, constants.norm_epsilon)
-    query = rms_norm(
-        F.linear(normalized, weights.q_proj).view(head_shape),
-        weights.q_norm,
-        constants.norm_epsilon,
-    ).transpose(1, 2)
-    key = rms_norm(
-        F.linear(normalized, weights.k_proj).view(head_shape),
-        weights.k_norm,
-        constants.norm_epsilon,
-    ).transpose(1, 2)
+    normalized = layer_rms_norm(constants, hidden_states, weights.input_norm)
+    query = apply_rope(
+        constants,
+        layer_rms_norm(
+            constants,
+            F.linear(normalized, weights.q_proj).view(head_shape),
+            weights.q_norm,
+        ),
+        cos,
+        sin,
+    )
+    key = apply_rope(
+        constants,
+        layer_rms_norm(
+            constants,
+            F.linear(normalized, weights.k_proj).view(head_shape),
+            weights.k_norm,
+        ),
+        cos,
+        sin,
+    )
     value = F.linear(normalized, weights.v_proj).view(head_shape).transpose(1, 2)
-
-    head_cos = cos.unsqueeze(1)
-    head_sin = sin.unsqueeze(1)
-    query = (query * head_cos) + (rotate_half(query) * head_sin)
-    key = (key * head_cos) + (rotate_half(key) * head_sin)
     if past_key is not None:
         key = torch.cat((past_key, key), dim=-2)
         value = torch.cat((past_value, value), dim=-2)
@@ -147,7 +195,15 @@ def decoder_layer_forward(
     hidden_semantic = hidden_states + F.linear(attended.contiguous(), weights.o_proj)
 
     if detail_read is not None:
-        source_key = past_key.index_select(-2, detail_read.source_indices)
+        indices = detail_read.source_indices
+        if indices.dim() == 1:
+            source_key = past_key.index_select(-2, indices)
+        else:
+            # A batch of branches reads each row's own source positions.
+            gather_shape = (-1, past_key.shape[1], -1, past_key.shape[-1])
+            source_key = past_key.gather(
+                2, indices[:, None, :, None].expand(gather_shape)
+            )
         hidden_semantic = hidden_semantic + detail_read.layer(
             query_post_rope=query,
             source_key_post_rope=source_key,
@@ -160,9 +216,7 @@ def decoder_layer_forward(
     else:
         pass
 
-    post_normalized = rms_norm(
-        hidden_semantic, weights.post_norm, constants.norm_epsilon
-    )
+    post_normalized = layer_rms_norm(constants, hidden_semantic, weights.post_norm)
     gated = F.silu(F.linear(post_normalized, weights.gate_proj))
     mlp_output = F.linear(
         gated * F.linear(post_normalized, weights.up_proj), weights.down_proj

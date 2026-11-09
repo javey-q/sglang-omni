@@ -16,7 +16,11 @@ from sglang_omni.models.lumina.generation import (
     IncompleteInterleavedGenerationError,
     IncompleteTextGenerationError,
 )
-from sglang_omni.models.lumina.modeling import LuminaRuntime, load_lumina_runtime
+from sglang_omni.models.lumina.modeling import (
+    DecoderOptions,
+    LuminaRuntime,
+    load_lumina_runtime,
+)
 from sglang_omni.models.lumina.preprocessor import preprocess
 from sglang_omni.models.lumina.settings import (
     EngineInputs,
@@ -65,6 +69,10 @@ def create_engine_executor(
     model_path: str,
     *,
     compile_decoder: bool,
+    code_lm_head: bool,
+    fused_rope: bool,
+    fused_rmsnorm: bool,
+    cfg_batch: bool,
     device: str | None = None,
     gpu_id: int | None = None,
 ) -> SimpleScheduler[StagePayload, StagePayload]:
@@ -73,6 +81,12 @@ def create_engine_executor(
         model_path,
         resolve_concrete_device(device, gpu_id),
         compile_decoder=compile_decoder,
+        options=DecoderOptions(
+            code_lm_head=code_lm_head,
+            fused_rope=fused_rope,
+            fused_rmsnorm=fused_rmsnorm,
+            cfg_batch=cfg_batch,
+        ),
     )
     tokenizer = runtime.processor.tokenizer
     sessions: dict[str, GenerationSession] = {}
