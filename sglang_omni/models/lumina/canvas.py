@@ -183,10 +183,10 @@ def assistant_aligned_tokens(
     return torch.cat(token_parts), torch.cat(event_parts)
 
 
-def prepare_interleaved_prefix(
-    runtime: LuminaRuntime, messages: list[ChatMessage]
+def serialized_prefix(
+    runtime: LuminaRuntime, messages: list[ChatMessage], *, route_token_id: int
 ) -> GenerationPrefix:
-    """Serialize a multi-turn history, encode its images, and open the next response.
+    """Serialize a multi-turn history under one output route, encode its images, and open the next response.
 
     The processor cannot render assistant image parts, so those turns pass through it as user turns and their headers are restored exactly afterwards.
     """
@@ -211,7 +211,7 @@ def prepare_interleaved_prefix(
         registry=registry,
     )
     raw_ids = insert_output_route_after_system_header(
-        raw_ids, tokenizer=tokenizer, registry=registry
+        raw_ids, tokenizer=tokenizer, registry=registry, route_token_id=route_token_id
     )
     raw_ids = canonicalize_message_text_inputs(
         raw_ids, messages, tokenizer=tokenizer, registry=registry
@@ -257,6 +257,31 @@ def prepare_interleaved_prefix(
             torch.tensor(grids, dtype=torch.long, device=device) if grids else None
         ),
     )
+
+
+def prepare_interleaved_prefix(
+    runtime: LuminaRuntime, messages: list[ChatMessage]
+) -> GenerationPrefix:
+    """A turn whose events the model decides one by one."""
+    return serialized_prefix(
+        runtime,
+        messages,
+        route_token_id=runtime.model.registry.out_interleaved_token_id,
+    )
+
+
+def prepare_image_prefix(
+    runtime: LuminaRuntime, messages: list[ChatMessage]
+) -> GenerationPrefix:
+    """A T2I or I2I turn: the image route, with the one image already opened."""
+    registry = runtime.model.registry
+    prefix = serialized_prefix(
+        runtime, messages, route_token_id=registry.out_image_token_id
+    )
+    vision_start = torch.tensor(
+        [registry.vision_start_token_id], device=prefix.input_ids.device
+    )
+    return append_clean_event(prefix, vision_start, kind=CleanEventKind.IMAGE_START)
 
 
 def append_optional_tensor(

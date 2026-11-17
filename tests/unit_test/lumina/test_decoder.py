@@ -9,7 +9,7 @@ from torch._dynamo.utils import counters
 from transformers import DynamicCache
 
 from sglang_omni.models.lumina.contracts import CFGBranch, TokenRegistry
-from sglang_omni.models.lumina.generation import sample_image_tokens
+from sglang_omni.models.lumina.image_codes import sample_image_tokens
 from sglang_omni.models.lumina.kv_cache import GenerationKVCache
 from sglang_omni.models.lumina.modeling import DecoderOptions, LuminaModel
 from sglang_omni.models.lumina.target_inputs import TargetInputs, stack_image_branches
@@ -280,6 +280,31 @@ def test_code_columns_sample_the_codes_the_role_mask_allows() -> None:
     assert torch.equal(masked_ids, code_ids)
     assert torch.equal(code_ids, codes.argmax(-1) + registry.code_start_id)
     assert torch.equal(masked_probability, code_probability)
+
+
+def test_zero_temperature_and_a_full_nucleus_follow_the_trained_sampler() -> None:
+    """The T2I and I2I protocols decode greedily; a top_p of 1 must not drop codes the cumulative sum rounds past 1."""
+    registry = TokenRegistry()
+    codes = torch.randn(
+        (1, 64, registry.codebook_size), generator=torch.Generator().manual_seed(9)
+    )
+
+    def sample(temperature: float) -> torch.Tensor:
+        sampled, _ = sample_image_tokens(
+            codes,
+            registry=registry,
+            temperature=temperature,
+            top_p=1.0,
+            generator=torch.Generator().manual_seed(3),
+            code_columns=True,
+        )
+        return sampled - registry.code_start_id
+
+    assert torch.equal(sample(0.0), codes.argmax(-1))
+    plain = torch.multinomial(
+        codes[0].softmax(-1), 1, generator=torch.Generator().manual_seed(3)
+    )
+    assert torch.equal(sample(1.0), plain.view(1, -1))
 
 
 def branch_inputs(

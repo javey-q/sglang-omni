@@ -45,6 +45,8 @@ def context_for(
 
 
 USER_TURN = [{"role": "user", "content": "Draw a cat."}]
+IMAGE_PART = {"type": "image_url", "image_url": {"url": "data:image/png;base64,"}}
+EDIT_TURN = [{"role": "user", "content": [IMAGE_PART, "Make it blue."]}]
 
 
 def test_start_prepares_with_validated_params() -> None:
@@ -72,6 +74,20 @@ def test_start_prepares_with_validated_params() -> None:
         ({"messages": USER_TURN, "images": ["a.png"]}, None),
         (USER_TURN, {"height": 100}),
         (USER_TURN, {"unknown": 1}),
+        (USER_TURN, {"task": "i2i"}),
+        (EDIT_TURN, {"task": "t2i"}),
+        (
+            [{"role": "user", "content": [IMAGE_PART, IMAGE_PART, "Merge them."]}],
+            {"task": "i2i"},
+        ),
+        (
+            [
+                {"role": "user", "content": "A cat."},
+                {"role": "assistant", "content": "Here."},
+                {"role": "user", "content": "Again."},
+            ],
+            {"task": "t2i"},
+        ),
     ],
 )
 def test_start_rejects_requests_it_cannot_serve(
@@ -79,6 +95,29 @@ def test_start_rejects_requests_it_cannot_serve(
 ) -> None:
     with pytest.raises(UMMRequestError):
         LuminaUMMAdapter("model").start(context_for(inputs, options=options))
+
+
+@pytest.mark.parametrize(
+    ("inputs", "task"),
+    [
+        (USER_TURN, "t2i"),
+        ([{"role": "system", "content": "Be brief."}, *EDIT_TURN], "i2i"),
+    ],
+)
+def test_image_tasks_take_their_protocol_values_unless_the_client_sets_them(
+    inputs: object, task: str
+) -> None:
+    """The T2I and I2I values of the trained evaluation protocol, copied from it."""
+    adapter = LuminaUMMAdapter("model")
+    protocol = adapter.start(context_for(inputs, options={"task": task}))
+    generation = protocol.request.metadata["lumina_generation"]
+    expected = (64, 4.0, 4.0) if task == "t2i" else (8, 4.0, 1.0)
+    assert (generation["image_steps"], generation["g_text"], generation["g_image"]) == (
+        expected
+    )
+    assert (generation["image_temperature"], generation["top_p"]) == (0.0, 1.0)
+    chosen = adapter.start(context_for(inputs, options={"task": task, "top_p": 0.9}))
+    assert chosen.request.metadata["lumina_generation"]["top_p"] == 0.9
 
 
 def test_start_rejects_a_budget_the_deployment_cannot_run() -> None:

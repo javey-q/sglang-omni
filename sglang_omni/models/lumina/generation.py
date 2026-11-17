@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -15,14 +14,13 @@ from sglang_omni.models.lumina.canvas import (
     append_native_image_reprefill,
 )
 from sglang_omni.models.lumina.contracts import (
-    GENERATED_GRID_FACTOR,
     TEXT_BLOCK_SIZE,
-    CFGBranch,
     CleanEventKind,
     OutputRole,
     TokenRegistry,
     TokenRole,
 )
+from sglang_omni.models.lumina.image_codes import generate_image_codes
 from sglang_omni.models.lumina.kv_cache import GenerationKVCache
 from sglang_omni.models.lumina.modeling import LuminaRuntime
 from sglang_omni.models.lumina.serialization import canonicalize_generated_text_block
@@ -59,34 +57,6 @@ class IncompleteInterleavedGenerationError(RuntimeError):
     """Interleaved generation exhausted its event budget before im_end."""
 
 
-def cfg_branch_coefficients(g_text: float, g_image: float) -> dict[CFGBranch, float]:
-    """Expanded coefficients of F + g_text(F-I) + g_image(I-U)."""
-    return {
-        CFGBranch.FULL: 1.0 + g_text,
-        CFGBranch.IMAGE_ONLY: g_image - g_text,
-        CFGBranch.UNCONDITIONAL: -g_image,
-    }
-
-
-def required_cfg_branches(g_text: float, g_image: float) -> tuple[CFGBranch, ...]:
-    coefficients = cfg_branch_coefficients(g_text, g_image)
-    return tuple(branch for branch, value in coefficients.items() if abs(value) > 0.0)
-
-
-def combine_cfg_logits(
-    logits: dict[CFGBranch, torch.Tensor],
-    *,
-    g_text: float,
-    g_image: float,
-) -> torch.Tensor:
-    coefficients = cfg_branch_coefficients(g_text, g_image)
-    required = required_cfg_branches(g_text, g_image)
-    result = logits[required[0]] * coefficients[required[0]]
-    for branch in required[1:]:
-        result = result + logits[branch] * coefficients[branch]
-    return result
-
-
 def greedy_tokens(
     logits: torch.Tensor,
     *,
@@ -99,37 +69,6 @@ def greedy_tokens(
     probabilities = torch.softmax(flat, -1).gather(-1, sampled)
     shape = logits.shape[:-1]
     return sampled.view(shape), probabilities.view(shape)
-
-
-def sample_image_tokens(
-    logits: torch.Tensor,
-    *,
-    registry: TokenRegistry,
-    temperature: float,
-    top_p: float,
-    generator: torch.Generator,
-    code_columns: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample token ids; code-column logits hold exactly the codes the role mask allows."""
-    if code_columns:
-        flat = logits.float()
-        offset = registry.code_start_id
-    else:
-        flat = registry.apply_role_mask(logits, OutputRole.IMAGE_SPAN).float()
-        offset = 0
-    scaled = flat.reshape(-1, flat.shape[-1]) / temperature
-    ordered, indices = scaled.sort(descending=True)
-    cumulative = ordered.softmax(-1).cumsum(-1)
-    reject = cumulative > top_p
-    reject[:, 1:] = reject[:, :-1].clone()
-    reject[:, 0] = False
-    reject = torch.zeros_like(reject).scatter(-1, indices, reject)
-    scaled = scaled.masked_fill(reject, -torch.inf)
-    distribution = scaled.softmax(-1)
-    sampled = torch.multinomial(distribution, 1, generator=generator)
-    probabilities = distribution.gather(-1, sampled)
-    shape = logits.shape[:-1]
-    return (sampled + offset).view(shape), probabilities.view(shape)
 
 
 def mask_premature_text_align(
@@ -146,76 +85,6 @@ def mask_premature_text_align(
         ..., registry.align_token_id
     ].masked_fill(~end_before, -torch.inf)
     return result
-
-
-def scheduled_image_transfer_count(
-    remaining: int, *, step: int, total_steps: int
-) -> int:
-    """How many masked codes a cosine schedule reveals at this step, at least."""
-    steps_left = total_steps - step
-    if steps_left == 1:
-        return remaining
-    else:
-        pass
-    current_survival = math.cos(math.pi * (step / total_steps) / 2.0)
-    next_survival = math.cos(math.pi * ((step + 1) / total_steps) / 2.0)
-    scheduled = math.ceil(remaining * (1.0 - next_survival / current_survival))
-    return min(remaining, max(1, scheduled))
-
-
-def generate_image_codes(
-    kv_cache: GenerationKVCache,
-    prefix: GenerationPrefix,
-    *,
-    height: int,
-    width: int,
-    params: LuminaGenerationParams,
-    generator: torch.Generator,
-) -> list[int]:
-    """Reveal one canvas under three-branch CFG and return its raw InsightTok codes."""
-    registry = prefix.registry
-    current = torch.full(
-        (1, (height // GENERATED_GRID_FACTOR) * (width // GENERATED_GRID_FACTOR)),
-        registry.mask_token_id,
-        dtype=torch.long,
-        device=prefix.input_ids.device,
-    )
-    required = required_cfg_branches(params.g_text, params.g_image)
-    for step in range(params.image_steps):
-        active = current == registry.mask_token_id
-        if not bool(active.any().item()):
-            break
-        else:
-            pass
-        branch_logits = kv_cache.forward_image_branches(
-            prefix, current, branches=required, height=height, width=width
-        )
-        logits = combine_cfg_logits(
-            branch_logits, g_text=params.g_text, g_image=params.g_image
-        )
-        sampled, probability = sample_image_tokens(
-            logits,
-            registry=registry,
-            temperature=params.image_temperature,
-            top_p=params.top_p,
-            generator=generator,
-            code_columns=kv_cache.image_code_columns(TokenRole.IMAGE_TARGET),
-        )
-        scheduled = scheduled_image_transfer_count(
-            int(active.sum().item()), step=step, total_steps=params.image_steps
-        )
-        confidence = torch.where(
-            active, probability, torch.full_like(probability, -torch.inf)
-        )
-        transfer = (confidence > params.confidence_threshold) & active
-        if int(transfer.sum().item()) < scheduled:
-            transfer = torch.zeros_like(active)
-            transfer.scatter_(1, confidence.topk(scheduled, dim=-1).indices, True)
-        else:
-            pass
-        current = torch.where(transfer & active, sampled, current)
-    assert not bool((current == registry.mask_token_id).any().item())
-    return [value - registry.code_start_id for value in current[0].tolist()]
 
 
 def generate_text_blocks(
@@ -319,7 +188,9 @@ class GenerationSession:
 
     @torch.inference_mode()
     def step(self) -> TextEvent | ImageEvent | EndEvent:
-        if self.is_exhausted:
+        if self.params.task != "interleaved":
+            return self.task_image_step()
+        elif self.is_exhausted:
             raise IncompleteInterleavedGenerationError(
                 "Interleaved generation exceeded max_events without <|im_end|>"
             )
@@ -362,6 +233,29 @@ class GenerationSession:
         else:
             pass
         self.image_event_count += 1
+        event = self.draw_image()
+        current = append_native_image_reprefill(
+            self.runtime,
+            self.prefix,
+            event.image,
+            event.raw_ids,
+            height=event.height,
+            width=event.width,
+        )
+        self.kv_cache.commit_native_image_reprefill(self.prefix, current)
+        self.prefix = current
+        return event
+
+    def task_image_step(self) -> ImageEvent | EndEvent:
+        """A T2I or I2I turn: its prefix already opens the one image, and nothing reads it afterwards."""
+        if self.image_event_count:
+            return EndEvent()
+        else:
+            self.image_event_count += 1
+            return self.draw_image()
+
+    def draw_image(self) -> ImageEvent:
+        """Reveal the opened canvas and decode it."""
         height, width = self.params.height, self.params.width
         raw_ids = generate_image_codes(
             self.kv_cache,
@@ -372,9 +266,4 @@ class GenerationSession:
             generator=self.generator,
         )
         image = self.runtime.decode_codes(raw_ids, height, width)
-        current = append_native_image_reprefill(
-            self.runtime, self.prefix, image, raw_ids, height=height, width=width
-        )
-        self.kv_cache.commit_native_image_reprefill(self.prefix, current)
-        self.prefix = current
         return ImageEvent(raw_ids, height, width, image)

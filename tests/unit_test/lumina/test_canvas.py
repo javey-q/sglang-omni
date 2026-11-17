@@ -12,9 +12,9 @@ from sglang_omni.models.lumina.contracts import (
     TokenRole,
     VisualSpanKind,
 )
-from sglang_omni.models.lumina.generation import (
+from sglang_omni.models.lumina.generation import mask_premature_text_align
+from sglang_omni.models.lumina.image_codes import (
     cfg_branch_coefficients,
-    mask_premature_text_align,
     required_cfg_branches,
     scheduled_image_transfer_count,
 )
@@ -30,6 +30,7 @@ from sglang_omni.models.lumina.serialization import (
     append_text_end_and_align,
     canonicalize_generated_text_block,
 )
+from sglang_omni.models.lumina.settings import LuminaGenerationParams, MaskSchedule
 
 REGISTRY = TokenRegistry()
 DEVICE = torch.device("cpu")
@@ -289,11 +290,17 @@ def test_a_zero_coefficient_skips_its_branch(
     assert required_cfg_branches(g_text, g_image) == expected
 
 
+@pytest.mark.parametrize("schedule", ["linear", "cosine", "power"])
 @pytest.mark.parametrize(("total", "steps"), [(256, 8), (144, 8), (4, 8), (1024, 1)])
-def test_schedule_reveals_every_code_by_the_last_step(total: int, steps: int) -> None:
+def test_schedule_reveals_every_code_by_the_last_step(
+    schedule: MaskSchedule, total: int, steps: int
+) -> None:
+    params = LuminaGenerationParams(mask_schedule=schedule)
     remaining = total
     for step in range(steps):
-        count = scheduled_image_transfer_count(remaining, step=step, total_steps=steps)
+        count = scheduled_image_transfer_count(
+            remaining, step=step, total_steps=steps, params=params
+        )
         assert (1 if remaining else 0) <= count <= remaining
         remaining -= count
     assert remaining == 0

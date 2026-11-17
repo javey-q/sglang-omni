@@ -6,11 +6,34 @@ from __future__ import annotations
 from typing import Literal, TypedDict
 
 from PIL import Image
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from sglang_omni.pipeline.umm import UMMFinishReason
 
 IMAGE_EDGE_FACTOR = 32
+
+# interleaved answers in text and images; t2i and i2i draw exactly one image.
+LuminaTask = Literal["interleaved", "t2i", "i2i"]
+MaskSchedule = Literal["linear", "cosine", "power"]
+# threshold_floor reveals every code above the threshold, and at least the scheduled count.
+ConfidencePolicy = Literal["threshold_floor", "scheduled_topk"]
+# The trained T2I and I2I protocols: greedy codes, T2I with text CFG only and many steps.
+IMAGE_TASK_DEFAULTS: dict[str, dict[str, int | float]] = {
+    "t2i": {
+        "image_steps": 64,
+        "g_text": 4.0,
+        "g_image": 4.0,
+        "image_temperature": 0.0,
+        "top_p": 1.0,
+    },
+    "i2i": {
+        "image_steps": 8,
+        "g_text": 4.0,
+        "g_image": 1.0,
+        "image_temperature": 0.0,
+        "top_p": 1.0,
+    },
+}
 
 
 class TextPart(TypedDict):
@@ -34,7 +57,7 @@ class ChatMessage(TypedDict):
 
 class EngineInputs(TypedDict):
     messages: list[ChatMessage]
-    generation: dict[str, int | float | None]
+    generation: dict[str, int | float | str | None]
 
 
 class TextSegment(TypedDict):
@@ -64,6 +87,7 @@ class LuminaGenerationParams(BaseModel):
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False, strict=True)
 
+    task: LuminaTask = "interleaved"
     height: int = Field(default=256, ge=32, le=1024)
     width: int = Field(default=256, ge=32, le=1024)
     input_long_edge: int = Field(default=256, ge=32, le=1024)
@@ -74,10 +98,23 @@ class LuminaGenerationParams(BaseModel):
     image_steps: int = Field(default=8, ge=1)
     g_text: float = Field(default=4.0, ge=0.0)
     g_image: float = Field(default=1.0, ge=0.0)
-    image_temperature: float = Field(default=1.0, gt=0.0)
+    # Zero takes the most likely code.
+    image_temperature: float = Field(default=1.0, ge=0.0)
     top_p: float = Field(default=0.95, gt=0.0, le=1.0)
     confidence_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
+    mask_schedule: MaskSchedule = "cosine"
+    mask_schedule_power: float = Field(default=2.0, gt=0.0)
+    confidence_policy: ConfidencePolicy = "threshold_floor"
     seed: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def task_defaults(cls, data: object) -> object:
+        """Fields a T2I or I2I client leaves out take that task's protocol values."""
+        if isinstance(data, dict) and data.get("task") in IMAGE_TASK_DEFAULTS:
+            return {**IMAGE_TASK_DEFAULTS[data["task"]], **data}
+        else:
+            return data
 
     @field_validator("height", "width", "input_long_edge")
     @classmethod

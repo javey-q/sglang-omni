@@ -8,7 +8,7 @@ from dataclasses import replace
 
 from pydantic import ValidationError
 
-from sglang_omni.models.lumina.settings import LuminaGenerationParams
+from sglang_omni.models.lumina.settings import LuminaGenerationParams, LuminaTask
 from sglang_omni.pipeline.umm import (
     CloseReason,
     UMMContext,
@@ -59,6 +59,32 @@ def validate_messages(inputs: object) -> None:
         pass
 
 
+def validate_image_task(inputs: object, task: LuminaTask) -> None:
+    """T2I and I2I serve one user turn, with no source image and exactly one."""
+    messages = inputs.get("messages") if isinstance(inputs, dict) else inputs
+    turns = [message for message in messages if message["role"] != "system"]
+    if len(turns) != 1:
+        raise UMMRequestError(f"Lumina {task} takes exactly one user turn")
+    else:
+        pass
+    content = turns[0]["content"]
+    images = (
+        0
+        if isinstance(content, str)
+        else sum(
+            isinstance(part, dict) and part.get("type") in ("image", "image_url")
+            for part in content
+        )
+    )
+    expected = 1 if task == "i2i" else 0
+    if images != expected:
+        raise UMMRequestError(
+            f"Lumina {task} takes {expected} input images, the request has {images}"
+        )
+    else:
+        pass
+
+
 def generation_params(request: OmniRequest) -> LuminaGenerationParams:
     """The client's Lumina controls from stage_params.orchestrator."""
     stage_params = request.params.get("stage_params") or {}
@@ -93,6 +119,10 @@ class LuminaUMMAdapter:
     def start(self, context: UMMContext) -> UMMStep:
         validate_messages(context.request.inputs)
         params = generation_params(context.request)
+        if params.task != "interleaved":
+            validate_image_task(context.request.inputs, params.task)
+        else:
+            pass
         # Preparation, then at most one dispatch per allowed decision.
         needed = params.max_events + 2
         if needed > context.remaining_dispatches:

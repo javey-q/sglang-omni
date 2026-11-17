@@ -143,8 +143,9 @@ def insert_output_route_after_system_header(
     *,
     tokenizer: PreTrainedTokenizerBase,
     registry: TokenRegistry,
+    route_token_id: int,
 ) -> torch.Tensor:
-    """Replace the system body with the interleaved output-route token."""
+    """Replace the system body with the output-route token of the task."""
     header = tokenizer.encode("<|im_start|>system\n", add_special_tokens=False)
     token_values = raw_ids.detach().cpu().tolist()
     offsets = subsequence_offsets(token_values, header)
@@ -152,8 +153,8 @@ def insert_output_route_after_system_header(
         raise ValueError(
             f"Output routing needs exactly one system header, found {len(offsets)}"
         )
-    elif registry.out_interleaved_token_id in token_values:
-        raise ValueError("Output-route token is already present in the prompt")
+    elif any(route in token_values for route in registry.route_ids):
+        raise ValueError("An output-route token is already present in the prompt")
     else:
         pass
     content_start = offsets[0] + len(header)
@@ -165,7 +166,7 @@ def insert_output_route_after_system_header(
         label="the system turn end",
     )
     route = torch.tensor(
-        [registry.out_interleaved_token_id],
+        [route_token_id],
         dtype=raw_ids.dtype,
         device=raw_ids.device,
     )
