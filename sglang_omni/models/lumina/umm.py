@@ -8,7 +8,11 @@ from dataclasses import replace
 
 from pydantic import ValidationError
 
-from sglang_omni.models.lumina.settings import LuminaGenerationParams, LuminaTask
+from sglang_omni.models.lumina.settings import (
+    IMAGE_TASK_DEFAULTS,
+    LuminaGenerationParams,
+    LuminaTask,
+)
 from sglang_omni.pipeline.umm import (
     CloseReason,
     UMMContext,
@@ -119,7 +123,7 @@ class LuminaUMMAdapter:
     def start(self, context: UMMContext) -> UMMStep:
         validate_messages(context.request.inputs)
         params = generation_params(context.request)
-        if params.task != "interleaved":
+        if params.task in IMAGE_TASK_DEFAULTS:
             validate_image_task(context.request.inputs, params.task)
         else:
             pass

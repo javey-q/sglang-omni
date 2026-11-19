@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Canvas labels, the attention program, positions, and the generation arithmetic."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from sglang_omni.models.lumina.attention import event_attention_mask
+from sglang_omni.models.lumina.canvas import GenerationPrefix
 from sglang_omni.models.lumina.contracts import (
     CFGBranch,
     ConditionProvenance,
@@ -12,7 +15,12 @@ from sglang_omni.models.lumina.contracts import (
     TokenRole,
     VisualSpanKind,
 )
-from sglang_omni.models.lumina.generation import mask_premature_text_align
+from sglang_omni.models.lumina.generation import (
+    EndEvent,
+    GenerationSession,
+    TextEvent,
+    mask_premature_text_align,
+)
 from sglang_omni.models.lumina.image_codes import (
     cfg_branch_coefficients,
     required_cfg_branches,
@@ -321,3 +329,76 @@ def test_align_is_only_allowed_after_a_text_end_in_the_same_block() -> None:
     masked = mask_premature_text_align(logits, current, registry=REGISTRY)
     allowed = masked[0, :, REGISTRY.align_token_id] > -torch.inf
     assert allowed.tolist() == [False, False, True, True]
+
+
+class ScriptedKVCache:
+    """Answers the decision with text_start and each text block from its script, at full confidence."""
+
+    def __init__(self, blocks: list[list[int]]) -> None:
+        self.blocks = blocks
+        self.commit_count = 0
+
+    def forward_event(
+        self, prefix: GenerationPrefix, current_ids: torch.Tensor, *, role: TokenRole
+    ) -> torch.Tensor:
+        length = current_ids.shape[1]
+        logits = torch.full((1, length, REGISTRY.new_vocab_size), -30.0)
+        if role == TokenRole.SINGLETON_TARGET:
+            logits[0, 0, REGISTRY.text_start_token_id] = 30.0
+        else:
+            committed_blocks = int(prefix.metadata.text_block_ids.max().item()) + 1
+            block = torch.tensor(self.blocks[committed_blocks])
+            logits[0, torch.arange(length), block] = 30.0
+        return logits
+
+    def commit_clean_prefix_change(
+        self, previous: GenerationPrefix, current: GenerationPrefix
+    ) -> None:
+        self.commit_count += 1
+
+
+def scripted_session(**options: str) -> GenerationSession:
+    prefix = GenerationPrefix(
+        input_ids=torch.tensor([[REGISTRY.im_start_token_id, 100]]),
+        position_ids=torch.arange(2).view(1, 1, -1).expand(3, 1, -1),
+        metadata=HEADER,
+        registry=REGISTRY,
+        pixel_values=None,
+        image_grid_thw=None,
+        source_insight_codes=None,
+        source_insight_grid_hw=None,
+    )
+    session = GenerationSession(
+        SimpleNamespace(device=DEVICE),
+        prefix,
+        params=LuminaGenerationParams(**options),
+    )
+    session.kv_cache = ScriptedKVCache(
+        [
+            [100, 101, 102, 103],
+            [
+                104,
+                REGISTRY.text_end_token_id,
+                REGISTRY.align_token_id,
+                REGISTRY.align_token_id,
+            ],
+        ]
+    )
+    return session
+
+
+def test_an_understanding_turn_answers_once_and_leaves_its_closing_block_uncommitted() -> (
+    None
+):
+    """An interleaved turn decides again after its text, so there the closing block must reach the cache."""
+    understanding = scripted_session(task="mmu", assistant_prefill="<think>")
+    assert understanding.step() == TextEvent(
+        [REGISTRY.think_start_token_id, 101, 102, 103, 104]
+    )
+    assert understanding.kv_cache.commit_count == 1
+    assert understanding.step() == EndEvent()
+
+    interleaved = scripted_session()
+    assert interleaved.step() == TextEvent([100, 101, 102, 103, 104])
+    # The decision, the first block, and the closing block.
+    assert interleaved.kv_cache.commit_count == 3

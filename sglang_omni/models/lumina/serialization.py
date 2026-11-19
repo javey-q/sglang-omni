@@ -76,8 +76,13 @@ def native_images(messages: list[ChatMessage]) -> list[Image.Image] | None:
 
 
 def process_messages(
-    processor: ProcessorMixin, messages: list[ChatMessage], device: torch.device
+    processor: ProcessorMixin,
+    messages: list[ChatMessage],
+    device: torch.device,
+    *,
+    should_fit_pixel_budget: bool,
 ) -> ProcessedMessages:
+    """Tokenize and patchify. Images keep their size unless the processor is to fit them into its own pixel budget."""
     text = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
@@ -87,7 +92,7 @@ def process_messages(
         videos=None,
         padding=False,
         return_tensors="pt",
-        do_resize=False,
+        do_resize=should_fit_pixel_budget,
     )
     pixel_values = batch.get("pixel_values")
     image_grid_thw = batch.get("image_grid_thw")

@@ -12,8 +12,8 @@ from sglang_omni.pipeline.umm import UMMFinishReason
 
 IMAGE_EDGE_FACTOR = 32
 
-# interleaved answers in text and images; t2i and i2i draw exactly one image.
-LuminaTask = Literal["interleaved", "t2i", "i2i"]
+# interleaved answers in text and images; t2i and i2i draw exactly one image; mmu answers in one text.
+LuminaTask = Literal["interleaved", "t2i", "i2i", "mmu"]
 MaskSchedule = Literal["linear", "cosine", "power"]
 # threshold_floor reveals every code above the threshold, and at least the scheduled count.
 ConfidencePolicy = Literal["threshold_floor", "scheduled_topk"]
@@ -94,6 +94,8 @@ class LuminaGenerationParams(BaseModel):
     max_events: int = Field(default=8, ge=1)
     max_image_events: int = Field(default=4, ge=0)
     max_new_tokens: int = Field(default=256, ge=1)
+    # An mmu answer may open with this token, so the model reasons before it answers.
+    assistant_prefill: Literal["<think>"] | None = None
     text_denoising_steps: int = Field(default=4, ge=1)
     image_steps: int = Field(default=8, ge=1)
     g_text: float = Field(default=4.0, ge=0.0)
@@ -115,6 +117,14 @@ class LuminaGenerationParams(BaseModel):
             return {**IMAGE_TASK_DEFAULTS[data["task"]], **data}
         else:
             return data
+
+    @model_validator(mode="after")
+    def prefill_opens_an_understanding_answer(self) -> LuminaGenerationParams:
+        """Only an mmu answer has a fixed opening a prefill can take."""
+        if self.assistant_prefill is not None and self.task != "mmu":
+            raise ValueError("assistant_prefill needs task mmu")
+        else:
+            return self
 
     @field_validator("height", "width", "input_long_edge")
     @classmethod

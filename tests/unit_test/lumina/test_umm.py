@@ -19,6 +19,7 @@ from sglang_omni.models.lumina.generation import (
 from sglang_omni.models.lumina.modeling import DecoderOptions
 from sglang_omni.models.lumina.preprocessor import (
     canonical_image,
+    native_resize_shape,
     preprocess,
     smart_resize_shape,
 )
@@ -76,6 +77,7 @@ def test_start_prepares_with_validated_params() -> None:
         (USER_TURN, {"unknown": 1}),
         (USER_TURN, {"task": "i2i"}),
         (EDIT_TURN, {"task": "t2i"}),
+        (USER_TURN, {"assistant_prefill": "<think>"}),
         (
             [{"role": "user", "content": [IMAGE_PART, IMAGE_PART, "Merge them."]}],
             {"task": "i2i"},
@@ -118,6 +120,19 @@ def test_image_tasks_take_their_protocol_values_unless_the_client_sets_them(
     assert (generation["image_temperature"], generation["top_p"]) == (0.0, 1.0)
     chosen = adapter.start(context_for(inputs, options={"task": task, "top_p": 0.9}))
     assert chosen.request.metadata["lumina_generation"]["top_p"] == 0.9
+
+
+def test_understanding_takes_history_and_any_number_of_images() -> None:
+    """The one-turn rule of the image tasks must not reach mmu."""
+    inputs = [
+        {"role": "user", "content": [IMAGE_PART, IMAGE_PART, "Compare them."]},
+        {"role": "assistant", "content": "The left one is larger."},
+        {"role": "user", "content": "Why?"},
+    ]
+    options = {"task": "mmu", "assistant_prefill": "<think>"}
+    step = LuminaUMMAdapter("model").start(context_for(inputs, options=options))
+    assert step.phase == PREPARE
+    assert step.request.metadata["lumina_generation"]["assistant_prefill"] == "<think>"
 
 
 def test_start_rejects_a_budget_the_deployment_cannot_run() -> None:
@@ -213,6 +228,42 @@ def test_smart_resize_fixes_the_long_edge(
     height: int, width: int, expected: tuple[int, int]
 ) -> None:
     assert smart_resize_shape(height, width, long_edge=256) == expected
+
+
+@pytest.mark.parametrize(
+    ("height", "width", "expected"),
+    [
+        (1080, 1920, (1088, 1920)),
+        (5000, 3000, (4992, 3008)),
+        (8000, 9000, (3840, 4320)),
+        (10, 10, (64, 64)),
+    ],
+)
+def test_native_resize_aligns_the_size_and_keeps_it_inside_the_native_range(
+    height: int, width: int, expected: tuple[int, int]
+) -> None:
+    """Sizes the model's understanding protocol gives these images, copied from it."""
+    assert native_resize_shape(height, width) == expected
+
+
+def test_understanding_reads_an_image_at_its_own_size() -> None:
+    """The long edge of the other tasks would shrink this photo to 256 by 160."""
+    image = Image.new("RGB", (1000, 600))
+    content = [{"type": "image", "image": image}, "What is it?"]
+    request = OmniRequest(
+        [{"role": "user", "content": content}],
+        {},
+        {"lumina_generation": LuminaGenerationParams(task="mmu").model_dump()},
+    )
+    payload = asyncio.run(preprocess(StagePayload("request", request, {})))
+    part = payload.data["messages"][1]["content"][0]
+    assert part["image"].size == (992, 608)
+    assert (part["resized_height"], part["resized_width"]) == (608, 992)
+
+    sliver = [{"type": "image", "image": Image.new("RGB", (4000, 10))}]
+    request = OmniRequest([{"role": "user", "content": sliver}], {}, request.metadata)
+    with pytest.raises(ValueError, match="aspect ratio"):
+        asyncio.run(preprocess(StagePayload("request", request, {})))
 
 
 def test_generated_history_keeps_its_exact_size_and_user_images_resize() -> None:

@@ -92,19 +92,32 @@ def generate_text_blocks(
     prefix: GenerationPrefix,
     *,
     params: LuminaGenerationParams,
+    opening_token_ids: list[int],
+    should_commit_closing_block: bool,
 ) -> tuple[list[int], GenerationPrefix]:
-    """Denoise and commit q=4 blocks until text_end; returns the visible tokens."""
+    """Denoise and commit q=4 blocks until text_end; returns the visible tokens.
+
+    The opening tokens start the first block and stay visible. A turn that ends with this text reads nothing after its closing block, so it can leave that block uncommitted.
+    """
     registry = prefix.registry
     device = prefix.input_ids.device
+    assert len(opening_token_ids) < TEXT_BLOCK_SIZE
     visible: list[int] = []
     steps = params.text_denoising_steps
-    for _ in range((params.max_new_tokens + TEXT_BLOCK_SIZE - 1) // TEXT_BLOCK_SIZE):
+    block_count = (params.max_new_tokens + TEXT_BLOCK_SIZE - 1) // TEXT_BLOCK_SIZE
+    for block_index in range(block_count):
         current = torch.full(
             (1, TEXT_BLOCK_SIZE),
             registry.mask_token_id,
             dtype=torch.long,
             device=device,
         )
+        if block_index == 0:
+            current[0, : len(opening_token_ids)] = torch.tensor(
+                opening_token_ids, dtype=torch.long, device=device
+            )
+        else:
+            pass
         for step in range(steps):
             active = current == registry.mask_token_id
             if not bool(active.any().item()):
@@ -141,7 +154,10 @@ def generate_text_blocks(
         visible.extend(block if end is None else block[:end])
         previous = prefix
         prefix = append_clean_event(previous, canonical_block, kind=CleanEventKind.TEXT)
-        kv_cache.commit_clean_prefix_change(previous, prefix)
+        if end is None or should_commit_closing_block:
+            kv_cache.commit_clean_prefix_change(previous, prefix)
+        else:
+            pass
         if end is not None:
             return visible, prefix
         else:
@@ -173,6 +189,7 @@ class GenerationSession:
             self.generator.manual_seed(params.seed)
         self.decision_count = 0
         self.image_event_count = 0
+        self.has_answered = False
 
     @property
     def is_exhausted(self) -> bool:
@@ -188,7 +205,9 @@ class GenerationSession:
 
     @torch.inference_mode()
     def step(self) -> TextEvent | ImageEvent | EndEvent:
-        if self.params.task != "interleaved":
+        if self.params.task == "mmu":
+            return self.task_text_step()
+        elif self.params.task != "interleaved":
             return self.task_image_step()
         elif self.is_exhausted:
             raise IncompleteInterleavedGenerationError(
@@ -218,7 +237,11 @@ class GenerationSession:
         elif token_id == registry.text_start_token_id:
             self.append_decision(token_id, kind=CleanEventKind.TEXT_START)
             token_ids, self.prefix = generate_text_blocks(
-                self.kv_cache, self.prefix, params=self.params
+                self.kv_cache,
+                self.prefix,
+                params=self.params,
+                opening_token_ids=[],
+                should_commit_closing_block=True,
             )
             return TextEvent(token_ids)
         else:
@@ -245,6 +268,27 @@ class GenerationSession:
         self.kv_cache.commit_native_image_reprefill(self.prefix, current)
         self.prefix = current
         return event
+
+    def task_text_step(self) -> TextEvent | EndEvent:
+        """An MMU turn: its prefix already opens the one answer, and nothing reads it afterwards."""
+        if self.has_answered:
+            return EndEvent()
+        else:
+            pass
+        self.has_answered = True
+        registry = self.prefix.registry
+        token_ids, self.prefix = generate_text_blocks(
+            self.kv_cache,
+            self.prefix,
+            params=self.params,
+            opening_token_ids=(
+                []
+                if self.params.assistant_prefill is None
+                else [registry.think_start_token_id]
+            ),
+            should_commit_closing_block=False,
+        )
+        return TextEvent(token_ids)
 
     def task_image_step(self) -> ImageEvent | EndEvent:
         """A T2I or I2I turn: its prefix already opens the one image, and nothing reads it afterwards."""

@@ -11,6 +11,7 @@ import logging
 from sglang_omni.models.lumina.canvas import (
     prepare_image_prefix,
     prepare_interleaved_prefix,
+    prepare_text_prefix,
 )
 from sglang_omni.models.lumina.generation import (
     EndEvent,
@@ -47,11 +48,12 @@ def create_preprocessing_executor() -> SimpleScheduler[StagePayload, StagePayloa
 def start_session(runtime: LuminaRuntime, inputs: EngineInputs) -> GenerationSession:
     """Build the canvas of a new turn; every history image is encoded here."""
     params = LuminaGenerationParams.model_validate(inputs["generation"])
-    prefix = (
-        prepare_interleaved_prefix(runtime, inputs["messages"])
-        if params.task == "interleaved"
-        else prepare_image_prefix(runtime, inputs["messages"])
-    )
+    if params.task == "interleaved":
+        prefix = prepare_interleaved_prefix(runtime, inputs["messages"])
+    elif params.task == "mmu":
+        prefix = prepare_text_prefix(runtime, inputs["messages"])
+    else:
+        prefix = prepare_image_prefix(runtime, inputs["messages"])
     return GenerationSession(runtime, prefix, params=params)
 
 

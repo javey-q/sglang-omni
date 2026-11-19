@@ -193,6 +193,8 @@ def serialized_prefix(
     registry = runtime.model.registry
     tokenizer = runtime.processor.tokenizer
     device = runtime.device
+    # The text route draws nothing, so it reads images at the model's pixel budget and needs no codes of them.
+    is_text_route = route_token_id == registry.out_text_token_id
     proxy_messages: list[ChatMessage] = [
         (
             {"role": "user", "content": message["content"]}
@@ -202,7 +204,12 @@ def serialized_prefix(
         )
         for message in messages
     ]
-    processed = process_messages(runtime.processor, proxy_messages, device)
+    processed = process_messages(
+        runtime.processor,
+        proxy_messages,
+        device,
+        should_fit_pixel_budget=is_text_route,
+    )
     raw_ids = rewrite_proxy_assistant_headers(
         processed.input_ids[0],
         proxy_messages,
@@ -228,7 +235,7 @@ def serialized_prefix(
     )
     codes: list[int] = []
     grids: list[list[int]] = []
-    for message in messages:
+    for message in [] if is_text_route else messages:
         for part in message_parts(message):
             if part["type"] == "image":
                 height, width = part["resized_height"], part["resized_width"]
@@ -282,6 +289,20 @@ def prepare_image_prefix(
         [registry.vision_start_token_id], device=prefix.input_ids.device
     )
     return append_clean_event(prefix, vision_start, kind=CleanEventKind.IMAGE_START)
+
+
+def prepare_text_prefix(
+    runtime: LuminaRuntime, messages: list[ChatMessage]
+) -> GenerationPrefix:
+    """An MMU turn: the text route, with the one answer already opened."""
+    registry = runtime.model.registry
+    prefix = serialized_prefix(
+        runtime, messages, route_token_id=registry.out_text_token_id
+    )
+    text_start = torch.tensor(
+        [registry.text_start_token_id], device=prefix.input_ids.device
+    )
+    return append_clean_event(prefix, text_start, kind=CleanEventKind.TEXT_START)
 
 
 def append_optional_tensor(
