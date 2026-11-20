@@ -16,6 +16,7 @@ from sglang_omni.models.lumina.contracts import (
     serialize_role_header,
 )
 from sglang_omni.models.lumina.settings import ChatMessage, ImagePart, TextPart
+from sglang_omni.pipeline.umm import UMMRequestError
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,45 @@ def process_messages(
         pixel_values=None if pixel_values is None else pixel_values.to(device),
         image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(device),
     )
+
+
+def reject_control_tokens(
+    messages: list[ChatMessage],
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    registry: TokenRegistry,
+) -> None:
+    """Client text must not carry the tokens that delimit turns, images, and text blocks, or that mark a target."""
+    control_ids = {
+        registry.im_start_token_id,
+        registry.im_end_token_id,
+        registry.vision_start_token_id,
+        registry.vision_end_token_id,
+        registry.vision_pad_token_id,
+        registry.image_pad_token_id,
+        registry.video_pad_token_id,
+        registry.text_start_token_id,
+        registry.text_end_token_id,
+        registry.align_token_id,
+        registry.mask_token_id,
+        *registry.route_ids,
+    }
+    for message in messages:
+        content = message["content"]
+        texts = (
+            [content]
+            if isinstance(content, str)
+            else [part["text"] for part in content if part["type"] == "text"]
+        )
+        for text in texts:
+            if control_ids.intersection(
+                tokenizer.encode(text, add_special_tokens=False)
+            ):
+                raise UMMRequestError(
+                    f"Lumina {message['role']} text cannot hold chat, image, or text block control tokens such as <|im_end|>"
+                )
+            else:
+                pass
 
 
 def separate_text_parts(
@@ -232,8 +272,6 @@ def insert_output_route_after_system_header(
         raise ValueError(
             f"Output routing needs exactly one system header, found {len(offsets)}"
         )
-    elif any(route in token_values for route in registry.route_ids):
-        raise ValueError("An output-route token is already present in the prompt")
     else:
         pass
     content_start = offsets[0] + len(header)
@@ -295,11 +333,6 @@ def canonicalize_message_text_inputs(
     token_values = raw_ids.detach().cpu().tolist()
     replacements: list[tuple[int, int, torch.Tensor]] = []
     cursor = 0
-    forbidden = {
-        registry.text_start_token_id,
-        registry.text_end_token_id,
-        registry.align_token_id,
-    }
     for message_index, message in enumerate(messages):
         _, content_start = find_subsequence(
             token_values,
@@ -329,8 +362,6 @@ def canonicalize_message_text_inputs(
             )
             if not encoded:
                 continue
-            elif forbidden.intersection(encoded):
-                raise ValueError("User text cannot contain Lumina text wrappers")
             else:
                 pass
             start, end = find_subsequence(

@@ -16,7 +16,9 @@ from sglang_omni.models.lumina.settings import (
     ImagePart,
     LuminaGenerationParams,
     TextPart,
+    image_part_source,
 )
+from sglang_omni.pipeline.umm import UMMRequestError
 from sglang_omni.preprocessing.image import ensure_image_list_async
 from sglang_omni.proto import StagePayload
 
@@ -43,7 +45,7 @@ def native_resize_shape(height: int, width: int) -> tuple[int, int]:
     """Round both edges to the factor; an area outside the native range is scaled back into it."""
     factor = IMAGE_EDGE_FACTOR
     if max(height, width) / min(height, width) > NATIVE_MAX_ASPECT_RATIO:
-        raise ValueError(
+        raise UMMRequestError(
             f"Lumina reads images up to an aspect ratio of {NATIVE_MAX_ASPECT_RATIO}, got {height}x{width}"
         )
     else:
@@ -105,15 +107,7 @@ def canonical_image(image: Image.Image, *, role: str, long_edge: int) -> ImagePa
 
 async def load_image(part: Mapping[str, object]) -> Image.Image:
     """The image of a chat part, from an inline image, a path, or a URL."""
-    source = part["image"] if part["type"] == "image" else part["image_url"]
-    if isinstance(source, Mapping):
-        source = source["url"]
-    else:
-        pass
-    if not isinstance(source, (str, Image.Image)):
-        raise ValueError("Lumina image parts need an image, a path, or a URL")
-    else:
-        pass
+    source = image_part_source(part)
     images = await ensure_image_list_async(source)
     image = images[0]
     if not isinstance(image, Image.Image):
@@ -123,31 +117,31 @@ async def load_image(part: Mapping[str, object]) -> Image.Image:
 
 
 async def canonical_content(
-    content: object, *, role: str, params: LuminaGenerationParams
+    content: str | list[str | Mapping[str, object]],
+    *,
+    role: str,
+    params: LuminaGenerationParams,
 ) -> list[TextPart | ImagePart]:
+    """Parts of a turn whose shape the controller already validated."""
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
-    elif not isinstance(content, list):
-        raise ValueError(f"Lumina {role} content must be text or a list of parts")
     else:
         pass
     parts: list[TextPart | ImagePart] = []
     for part in content:
         if isinstance(part, str):
             parts.append({"type": "text", "text": part})
-        elif not isinstance(part, dict):
-            raise ValueError("Lumina content parts must be text or image parts")
-        elif part.get("type") == "text":
-            parts.append({"type": "text", "text": part["text"]})
-        elif part.get("type") in ("image", "image_url"):
+        elif part["type"] == "text":
+            text = part["text"]
+            assert isinstance(text, str)
+            parts.append({"type": "text", "text": text})
+        else:
             image = await load_image(part)
             parts.append(
                 native_image(image)
                 if params.task == "mmu"
                 else canonical_image(image, role=role, long_edge=params.input_long_edge)
             )
-        else:
-            raise ValueError(f"Lumina does not accept {part.get('type')!r} parts")
     return parts
 
 
@@ -171,6 +165,16 @@ async def preprocess(payload: StagePayload) -> StagePayload:
             canonical.append({"role": role, "content": content})
         else:
             pass
+    if params.task in ("t2i", "i2i"):
+        # The trained T2I and I2I turn, whatever order the client sent: the source image, then the prompt as one text.
+        parts = canonical[-1]["content"]
+        prompt = "".join(part["text"] for part in parts if part["type"] == "text")
+        canonical[-1]["content"] = [
+            *(part for part in parts if part["type"] == "image"),
+            {"type": "text", "text": prompt},
+        ]
+    else:
+        pass
     inputs_for_engine: EngineInputs = {
         "messages": canonical,
         "generation": params.model_dump(),

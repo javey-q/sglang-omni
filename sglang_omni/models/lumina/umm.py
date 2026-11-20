@@ -6,12 +6,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 
+from PIL import Image
 from pydantic import ValidationError
 
 from sglang_omni.models.lumina.settings import (
     IMAGE_TASK_DEFAULTS,
     LuminaGenerationParams,
     LuminaTask,
+    image_part_source,
 )
 from sglang_omni.pipeline.umm import (
     CloseReason,
@@ -25,6 +27,37 @@ from sglang_omni.proto import OmniRequest
 
 PREPARE = "prepare"
 EVENT = "event"
+# Request params, set only when the client sent them, that mean the same Lumina control: the seed, and max_tokens or max_completion_tokens.
+TOP_LEVEL_CONTROLS = ("seed", "max_new_tokens")
+
+
+def validate_content(role: str, content: object) -> None:
+    """Text, or a list of text and image parts, in the shapes the preprocessing stage reads."""
+    if isinstance(content, str):
+        return
+    elif not isinstance(content, list):
+        raise UMMRequestError(f"Lumina {role} content must be text or a list of parts")
+    else:
+        pass
+    for part in content:
+        if isinstance(part, str):
+            pass
+        elif not isinstance(part, dict):
+            raise UMMRequestError("Lumina content parts must be text or image parts")
+        elif part.get("type") == "text":
+            if not isinstance(part.get("text"), str):
+                raise UMMRequestError("A Lumina text part needs its text")
+            else:
+                pass
+        elif part.get("type") in ("image", "image_url"):
+            if not isinstance(image_part_source(part), (str, Image.Image)):
+                raise UMMRequestError(
+                    "A Lumina image part needs an image, a path, or a URL"
+                )
+            else:
+                pass
+        else:
+            raise UMMRequestError(f"Lumina does not accept {part.get('type')!r} parts")
 
 
 def validate_messages(inputs: object) -> None:
@@ -53,6 +86,9 @@ def validate_messages(inputs: object) -> None:
             raise UMMRequestError(
                 "Lumina messages need a system, user, or assistant role"
             )
+        elif message["role"] != "system":
+            # A client's system turn is replaced by the output route, so its content is never read.
+            validate_content(message["role"], message.get("content"))
         else:
             pass
     if messages[-1]["role"] != "user":
@@ -90,7 +126,7 @@ def validate_image_task(inputs: object, task: LuminaTask) -> None:
 
 
 def generation_params(request: OmniRequest) -> LuminaGenerationParams:
-    """The client's Lumina controls from stage_params.orchestrator."""
+    """The client's Lumina controls from stage_params.orchestrator, which top-level fields fill in."""
     stage_params = request.params.get("stage_params") or {}
     options = (
         stage_params.get("orchestrator", {}) if isinstance(stage_params, dict) else None
@@ -99,10 +135,22 @@ def generation_params(request: OmniRequest) -> LuminaGenerationParams:
         raise UMMRequestError("stage_params.orchestrator must be a mapping")
     else:
         pass
+    merged = dict(options)
+    for name in TOP_LEVEL_CONTROLS:
+        value = request.params.get(name)
+        if value is None:
+            pass
+        elif name in options and options[name] != value:
+            raise UMMRequestError(
+                f"The top-level {name} {value} disagrees with "
+                f"stage_params.orchestrator.{name} {options[name]}"
+            )
+        else:
+            merged[name] = value
     try:
-        return LuminaGenerationParams.model_validate(options)
+        return LuminaGenerationParams.model_validate(merged)
     except ValidationError as error:
-        raise UMMRequestError(f"stage_params.orchestrator: {error}") from error
+        raise UMMRequestError(f"Lumina generation controls: {error}") from error
 
 
 def event_dispatch(context: UMMContext, inputs: Mapping[str, object]) -> UMMDispatch:

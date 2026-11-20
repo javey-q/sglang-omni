@@ -38,6 +38,7 @@ from sglang_omni.models.lumina.serialization import (
     insert_output_route_after_system_header,
     message_parts,
     process_messages,
+    reject_control_tokens,
     rewrite_proxy_assistant_headers,
     separate_text_parts,
 )
@@ -196,6 +197,7 @@ def serialized_prefix(
     device = runtime.device
     # The text route draws nothing, so it reads images at the model's pixel budget and needs no codes of them.
     is_text_route = route_token_id == registry.out_text_token_id
+    reject_control_tokens(messages, tokenizer=tokenizer, registry=registry)
     proxy_messages: list[ChatMessage] = [
         (
             {"role": "user", "content": message["content"]}

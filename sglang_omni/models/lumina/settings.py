@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Literal, TypedDict
 
 from PIL import Image
@@ -39,6 +40,12 @@ IMAGE_TASK_DEFAULTS: dict[str, dict[str, int | float]] = {
         "top_p": 1.0,
     },
 }
+
+
+def image_part_source(part: Mapping[str, object]) -> object:
+    """The inline image, path, or URL of a client's image or image_url part, still unchecked."""
+    source = part.get("image") if part.get("type") == "image" else part.get("image_url")
+    return source.get("url") if isinstance(source, Mapping) else source
 
 
 class TextPart(TypedDict):
@@ -118,7 +125,12 @@ class LuminaGenerationParams(BaseModel):
     @classmethod
     def task_defaults(cls, data: object) -> object:
         """Fields a T2I or I2I client leaves out take that task's protocol values."""
-        if isinstance(data, dict) and data.get("task") in IMAGE_TASK_DEFAULTS:
+        # A task that is not a string is left for field validation, which rejects it.
+        if (
+            isinstance(data, dict)
+            and isinstance(data.get("task"), str)
+            and data["task"] in IMAGE_TASK_DEFAULTS
+        ):
             return {**IMAGE_TASK_DEFAULTS[data["task"]], **data}
         else:
             return data

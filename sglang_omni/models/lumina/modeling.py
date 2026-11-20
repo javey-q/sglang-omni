@@ -411,6 +411,19 @@ def load_lumina_runtime(
     model.eval()
     if compile_decoder:
         model.enable_compiled_decoder()
+    elif options.fused_rope or options.fused_rmsnorm:
+        # The fused kernels build on first use, so one token makes a broken CUDA toolchain fail here rather than on the first request.
+        weight = model.get_input_embeddings().weight
+        with torch.inference_mode():
+            model.decode(
+                inputs_embeds=weight.new_zeros((1, 1, weight.shape[1])),
+                position_ids=torch.zeros(
+                    (3, 1, 1), dtype=torch.long, device=weight.device
+                ),
+                attention_mask=torch.ones(
+                    (1, 1, 1, 1), dtype=torch.bool, device=weight.device
+                ),
+            )
     else:
         pass
     insight_tok = InsightTok(

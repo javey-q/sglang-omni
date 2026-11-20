@@ -40,9 +40,11 @@ def context_for(
     inputs: object,
     *,
     options: dict[str, object] | None = None,
+    top_level: dict[str, object] | None = None,
     remaining_dispatches: int = 10,
 ) -> UMMContext:
     params = {} if options is None else {"stage_params": {"orchestrator": options}}
+    params.update(top_level or {})
     return UMMContext(
         execution_id="execution",
         request=OmniRequest(inputs, params, {}),
@@ -79,6 +81,12 @@ def test_start_prepares_with_validated_params() -> None:
             None,
         ),
         ({"messages": USER_TURN, "images": ["a.png"]}, None),
+        ([{"role": "user", "content": None}], {"task": "t2i"}),
+        ([{"role": "user", "content": [{"type": "text"}]}], None),
+        ([{"role": "user", "content": [{"type": "video", "video": "a.mp4"}]}], None),
+        ([{"role": "user", "content": [{"type": "input_audio"}]}], None),
+        ([{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}], None),
+        (USER_TURN, {"task": ["t2i"]}),
         (USER_TURN, {"height": 100}),
         (USER_TURN, {"image_steps": MAX_IMAGE_STEPS + 1}),
         (USER_TURN, {"max_new_tokens": MAX_NEW_TOKENS + 1}),
@@ -141,6 +149,17 @@ def test_understanding_takes_history_and_any_number_of_images() -> None:
     step = LuminaUMMAdapter("model").start(context_for(inputs, options=options))
     assert step.phase == PREPARE
     assert step.request.metadata["lumina_generation"]["assistant_prefill"] == "<think>"
+
+
+def test_top_level_seed_and_max_tokens_fill_the_lumina_controls() -> None:
+    """The OpenAI seed and max_tokens used to be dropped without an error."""
+    adapter = LuminaUMMAdapter("model")
+    top_level = {"seed": 5, "max_new_tokens": 64}
+    step = adapter.start(context_for(USER_TURN, top_level=top_level))
+    generation = step.request.metadata["lumina_generation"]
+    assert (generation["seed"], generation["max_new_tokens"]) == (5, 64)
+    with pytest.raises(UMMRequestError, match="disagrees"):
+        adapter.start(context_for(USER_TURN, options={"seed": 1}, top_level=top_level))
 
 
 def test_start_rejects_a_budget_the_deployment_cannot_run() -> None:
@@ -270,7 +289,7 @@ def test_understanding_reads_an_image_at_its_own_size() -> None:
 
     sliver = [{"type": "image", "image": Image.new("RGB", (4000, 10))}]
     request = OmniRequest([{"role": "user", "content": sliver}], {}, request.metadata)
-    with pytest.raises(ValueError, match="aspect ratio"):
+    with pytest.raises(UMMRequestError, match="aspect ratio"):
         asyncio.run(preprocess(StagePayload("request", request, {})))
 
 
@@ -333,6 +352,29 @@ def test_preprocess_canonicalizes_messages_and_adds_the_system_turn() -> None:
     assert payload.data["generation"]["seed"] == 3
 
 
+def test_an_edit_takes_the_trained_turn_whatever_order_the_client_sent() -> None:
+    """An edit sent text first used to reach the model text first, a layout its I2I protocol never has."""
+    image = Image.new("RGB", (64, 64))
+    request = OmniRequest(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Make it "},
+                    {"type": "image", "image": image},
+                    "blue.",
+                ],
+            }
+        ],
+        {},
+        {"lumina_generation": LuminaGenerationParams(task="i2i").model_dump()},
+    )
+    payload = asyncio.run(preprocess(StagePayload("request", request, {})))
+    content = payload.data["messages"][1]["content"]
+    assert [part["type"] for part in content] == ["image", "text"]
+    assert content[1]["text"] == "Make it blue."
+
+
 def test_preprocess_keeps_one_system_turn_when_the_client_sent_its_own() -> None:
     request = OmniRequest(
         [{"role": "system", "content": "Be brief."}, *USER_TURN],
@@ -342,16 +384,6 @@ def test_preprocess_keeps_one_system_turn_when_the_client_sent_its_own() -> None
     payload = asyncio.run(preprocess(StagePayload("request", request, {})))
     roles = [message["role"] for message in payload.data["messages"]]
     assert roles == ["system", "user"]
-
-
-def test_preprocess_rejects_parts_the_model_cannot_read() -> None:
-    request = OmniRequest(
-        [{"role": "user", "content": [{"type": "video", "video": "a.mp4"}]}],
-        {},
-        {"lumina_generation": LuminaGenerationParams().model_dump()},
-    )
-    with pytest.raises(ValueError, match="video"):
-        asyncio.run(preprocess(StagePayload("request", request, {})))
 
 
 class ScriptedSession:
