@@ -11,6 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from sglang_omni.pipeline.umm import UMMFinishReason
 
 IMAGE_EDGE_FACTOR = 32
+# The largest edge Lumina draws, so also the largest a generated history image keeps.
+MAX_IMAGE_EDGE = 1024
+# A running event cannot be stopped on the serial engine, so these bound how long one request holds it.
+MAX_IMAGE_STEPS = 256
+MAX_NEW_TOKENS = 4096
 
 # interleaved answers in text and images; t2i and i2i draw exactly one image; mmu answers in one text.
 LuminaTask = Literal["interleaved", "t2i", "i2i", "mmu"]
@@ -88,16 +93,16 @@ class LuminaGenerationParams(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False, strict=True)
 
     task: LuminaTask = "interleaved"
-    height: int = Field(default=256, ge=32, le=1024)
-    width: int = Field(default=256, ge=32, le=1024)
-    input_long_edge: int = Field(default=256, ge=32, le=1024)
+    height: int = Field(default=256, ge=32, le=MAX_IMAGE_EDGE)
+    width: int = Field(default=256, ge=32, le=MAX_IMAGE_EDGE)
+    input_long_edge: int = Field(default=256, ge=32, le=MAX_IMAGE_EDGE)
     max_events: int = Field(default=8, ge=1)
     max_image_events: int = Field(default=4, ge=0)
-    max_new_tokens: int = Field(default=256, ge=1)
+    max_new_tokens: int = Field(default=256, ge=1, le=MAX_NEW_TOKENS)
     # An mmu answer may open with this token, so the model reasons before it answers.
     assistant_prefill: Literal["<think>"] | None = None
     text_denoising_steps: int = Field(default=4, ge=1)
-    image_steps: int = Field(default=8, ge=1)
+    image_steps: int = Field(default=8, ge=1, le=MAX_IMAGE_STEPS)
     g_text: float = Field(default=4.0, ge=0.0)
     g_image: float = Field(default=1.0, ge=0.0)
     # Zero takes the most likely code.

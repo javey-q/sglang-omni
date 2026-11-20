@@ -103,6 +103,80 @@ def process_messages(
     )
 
 
+def separate_text_parts(
+    raw_ids: torch.Tensor,
+    messages: list[ChatMessage],
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    registry: TokenRegistry,
+) -> torch.Tensor:
+    """Tokenize each turn's header and every text part on its own, as the canvas wraps them.
+
+    The template renders a header newline and the text parts up to the next image as one string, so BPE can merge tokens across them. Each such run is checked against that string and then retokenized part by part.
+    """
+    token_values = raw_ids.detach().cpu().tolist()
+    separated: list[int] = []
+    cursor = 0
+    for message_index, message in enumerate(messages):
+        content = message["content"]
+        # The texts between consecutive images of the turn; the first run opens with the header.
+        text_runs: list[list[str]] = [[f"{message['role']}\n"]]
+        if isinstance(content, str):
+            text_runs[0].append(content)
+        else:
+            for part in content:
+                if part["type"] == "text":
+                    text_runs[-1].append(part["text"])
+                else:
+                    text_runs.append([])
+        _, run_start = find_subsequence(
+            token_values,
+            [registry.im_start_token_id],
+            cursor,
+            len(token_values),
+            label=f"the start of message {message_index}",
+        )
+        separated.extend(token_values[cursor:run_start])
+        for run_index, texts in enumerate(text_runs):
+            is_last_run = run_index == len(text_runs) - 1
+            closing_token_id = (
+                registry.im_end_token_id
+                if is_last_run
+                else registry.vision_start_token_id
+            )
+            run_end, _ = find_subsequence(
+                token_values,
+                [closing_token_id],
+                run_start,
+                len(token_values),
+                label=f"the end of a text run of message {message_index}",
+            )
+            rendered = tokenizer.encode("".join(texts), add_special_tokens=False)
+            if token_values[run_start:run_end] != rendered:
+                raise ValueError(
+                    f"Could not align the text of message {message_index} in the serialized conversation"
+                )
+            else:
+                pass
+            for text in texts:
+                separated.extend(tokenizer.encode(text, add_special_tokens=False))
+            if is_last_run:
+                next_start = run_end + 1
+            else:
+                _, next_start = find_subsequence(
+                    token_values,
+                    [registry.vision_end_token_id],
+                    run_end,
+                    len(token_values),
+                    label=f"an image end of message {message_index}",
+                )
+            separated.extend(token_values[run_end:next_start])
+            run_start = next_start
+        cursor = run_start
+    separated.extend(token_values[cursor:])
+    return torch.tensor(separated, dtype=raw_ids.dtype, device=raw_ids.device)
+
+
 def rewrite_proxy_assistant_headers(
     raw_ids: torch.Tensor,
     proxy_messages: list[ChatMessage],
@@ -210,51 +284,6 @@ def canonicalize_generated_text_block(
     return canonical, end
 
 
-def split_merged_header_newline(
-    raw_ids: torch.Tensor,
-    token_values: list[int],
-    message: ChatMessage,
-    *,
-    cursor: int,
-    tokenizer: PreTrainedTokenizerBase,
-    registry: TokenRegistry,
-) -> torch.Tensor:
-    """Retokenize a header whose newline BPE merged with newlines opening the first text."""
-    role = message["role"]
-    content = message["content"]
-    if isinstance(content, str):
-        first_text = content
-    elif content and content[0]["type"] == "text":
-        first_text = content[0]["text"]
-    else:
-        raise ValueError(f"Could not align the {role} header")
-    newline_ids = tokenizer.encode("\n", add_special_tokens=False)
-    role_prefix = [
-        registry.im_start_token_id,
-        *tokenizer.encode(role, add_special_tokens=False),
-    ]
-    _, prefix_end = find_subsequence(
-        token_values,
-        role_prefix,
-        cursor,
-        len(token_values),
-        label=f"the {role} header prefix",
-    )
-    merged = tokenizer.encode("\n" + first_text, add_special_tokens=False)
-    if token_values[prefix_end : prefix_end + len(merged)] != merged:
-        raise ValueError(f"Could not align the {role} header")
-    else:
-        pass
-    separated = torch.tensor(
-        [*newline_ids, *tokenizer.encode(first_text, add_special_tokens=False)],
-        dtype=raw_ids.dtype,
-        device=raw_ids.device,
-    )
-    return torch.cat(
-        (raw_ids[:prefix_end], separated, raw_ids[prefix_end + len(merged) :])
-    )
-
-
 def canonicalize_message_text_inputs(
     raw_ids: torch.Tensor,
     messages: list[ChatMessage],
@@ -272,25 +301,13 @@ def canonicalize_message_text_inputs(
         registry.align_token_id,
     }
     for message_index, message in enumerate(messages):
-        header = serialize_role_header(tokenizer, message["role"], registry)
-        label = f"{message['role']} header {message_index}"
-        try:
-            _, content_start = find_subsequence(
-                token_values, header, cursor, len(token_values), label=label
-            )
-        except ValueError:
-            raw_ids = split_merged_header_newline(
-                raw_ids,
-                token_values,
-                message,
-                cursor=cursor,
-                tokenizer=tokenizer,
-                registry=registry,
-            )
-            token_values = raw_ids.detach().cpu().tolist()
-            _, content_start = find_subsequence(
-                token_values, header, cursor, len(token_values), label=label
-            )
+        _, content_start = find_subsequence(
+            token_values,
+            serialize_role_header(tokenizer, message["role"], registry),
+            cursor,
+            len(token_values),
+            label=f"{message['role']} header {message_index}",
+        )
         turn_end, _ = find_subsequence(
             token_values,
             [registry.im_end_token_id],

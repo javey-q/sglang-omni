@@ -12,6 +12,7 @@ from sglang_omni.models.lumina import stages
 from sglang_omni.models.lumina.config import LuminaPipelineConfig
 from sglang_omni.models.lumina.generation import (
     EndEvent,
+    ImageEvent,
     IncompleteInterleavedGenerationError,
     IncompleteTextGenerationError,
     TextEvent,
@@ -23,7 +24,12 @@ from sglang_omni.models.lumina.preprocessor import (
     preprocess,
     smart_resize_shape,
 )
-from sglang_omni.models.lumina.settings import LuminaGenerationParams
+from sglang_omni.models.lumina.settings import (
+    MAX_IMAGE_STEPS,
+    MAX_NEW_TOKENS,
+    LuminaGenerationParams,
+    LuminaTask,
+)
 from sglang_omni.models.lumina.umm import EVENT, PREPARE, LuminaUMMAdapter
 from sglang_omni.pipeline.umm import UMMContext, UMMRequestError
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -74,6 +80,8 @@ def test_start_prepares_with_validated_params() -> None:
         ),
         ({"messages": USER_TURN, "images": ["a.png"]}, None),
         (USER_TURN, {"height": 100}),
+        (USER_TURN, {"image_steps": MAX_IMAGE_STEPS + 1}),
+        (USER_TURN, {"max_new_tokens": MAX_NEW_TOKENS + 1}),
         (USER_TURN, {"unknown": 1}),
         (USER_TURN, {"task": "i2i"}),
         (EDIT_TURN, {"task": "t2i"}),
@@ -281,6 +289,15 @@ def test_generated_history_keeps_its_exact_size_and_user_images_resize() -> None
     assert item["image"].size == (256, 256)
 
 
+def test_a_generated_history_image_stops_at_the_largest_drawn_edge() -> None:
+    """An aligned history image used to reach the image encoders at any size."""
+    item = canonical_image(
+        Image.new("RGB", (2048, 1024)), role="assistant", long_edge=256
+    )
+    assert (item["resized_height"], item["resized_width"]) == (512, 1024)
+    assert item["image"].size == (1024, 512)
+
+
 def test_preprocess_canonicalizes_messages_and_adds_the_system_turn() -> None:
     image = Image.new("RGB", (64, 64))
     request = OmniRequest(
@@ -341,12 +358,17 @@ class ScriptedSession:
     """Plays back one outcome per step; an exception stands for the engine raising it."""
 
     def __init__(
-        self, outcomes: list[TextEvent | EndEvent | Exception], *, is_exhausted: bool
+        self,
+        outcomes: list[TextEvent | ImageEvent | EndEvent | Exception],
+        *,
+        is_exhausted: bool,
+        task: LuminaTask,
     ) -> None:
         self.outcomes = outcomes
         self.is_exhausted = is_exhausted
+        self.params = LuminaGenerationParams(task=task)
 
-    def step(self) -> TextEvent | EndEvent:
+    def step(self) -> TextEvent | ImageEvent | EndEvent:
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -360,9 +382,10 @@ class EngineHarness:
     def __init__(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        scripts: list[list[TextEvent | EndEvent | Exception]],
+        scripts: list[list[TextEvent | ImageEvent | EndEvent | Exception]],
         *,
         is_exhausted: bool = False,
+        task: LuminaTask = "interleaved",
     ) -> None:
         tokenizer = SimpleNamespace(
             decode=lambda token_ids, skip_special_tokens: f"decoded{token_ids}"
@@ -374,7 +397,7 @@ class EngineHarness:
 
         def start_session(unused_runtime: object, inputs: object) -> ScriptedSession:
             session = ScriptedSession(
-                self.scripts[self.started], is_exhausted=is_exhausted
+                self.scripts[self.started], is_exhausted=is_exhausted, task=task
             )
             self.started += 1
             if self.on_start is not None:
@@ -443,6 +466,26 @@ def test_the_model_closing_its_turn_stops_and_running_out_of_decisions_is_length
         "output": {"kind": "text", "text": "decoded[1]"},
         "finish_reason": "length",
     }
+
+
+@pytest.mark.parametrize(
+    ("task", "event", "kind"),
+    [
+        ("t2i", ImageEvent([0], 32, 32, Image.new("RGB", (32, 32))), "image"),
+        ("i2i", ImageEvent([0], 32, 32, Image.new("RGB", (32, 32))), "image"),
+        ("mmu", TextEvent([1]), "text"),
+    ],
+)
+def test_a_one_output_task_ends_with_that_output(
+    monkeypatch: pytest.MonkeyPatch,
+    task: LuminaTask,
+    event: TextEvent | ImageEvent,
+    kind: str,
+) -> None:
+    """The output used to come back open, so the request waited behind every queued event for a dispatch that only ended it."""
+    harness = EngineHarness(monkeypatch, [[event]], task=task)
+    result = harness.dispatch()
+    assert (result["output"]["kind"], result["finish_reason"]) == (kind, "stop")
 
 
 def test_abort_landing_while_a_session_starts_still_releases_it(

@@ -5,9 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 
 from sglang_omni.models.lumina.attention import event_attention_mask
-from sglang_omni.models.lumina.canvas import GenerationPrefix
+from sglang_omni.models.lumina.canvas import GenerationPrefix, assistant_aligned_tokens
 from sglang_omni.models.lumina.contracts import (
     CFGBranch,
     ConditionProvenance,
@@ -16,7 +17,6 @@ from sglang_omni.models.lumina.contracts import (
     VisualSpanKind,
 )
 from sglang_omni.models.lumina.generation import (
-    EndEvent,
     GenerationSession,
     TextEvent,
     mask_premature_text_align,
@@ -37,8 +37,14 @@ from sglang_omni.models.lumina.metadata import (
 from sglang_omni.models.lumina.serialization import (
     append_text_end_and_align,
     canonicalize_generated_text_block,
+    canonicalize_message_text_inputs,
+    separate_text_parts,
 )
-from sglang_omni.models.lumina.settings import LuminaGenerationParams, MaskSchedule
+from sglang_omni.models.lumina.settings import (
+    ChatMessage,
+    LuminaGenerationParams,
+    MaskSchedule,
+)
 
 REGISTRY = TokenRegistry()
 DEVICE = torch.device("cpu")
@@ -259,6 +265,100 @@ def test_malformed_text_spans_are_rejected(tail: list[int]) -> None:
         text_boundary_spans(token_ids, registry=REGISTRY)
 
 
+class MergingTokenizer:
+    """One token per character, except the pairs BPE merges across a header or a text part boundary."""
+
+    MERGES = {"\n\n": 1000, ".B": 1001}
+
+    def encode(self, text: str, add_special_tokens: bool) -> list[int]:
+        token_ids: list[int] = []
+        index = 0
+        while index < len(text):
+            pair = text[index : index + 2]
+            if pair in self.MERGES:
+                token_ids.append(self.MERGES[pair])
+                index += 2
+            else:
+                token_ids.append(ord(text[index]))
+                index += 1
+        return token_ids
+
+
+def processor_ids(
+    tokenizer: MergingTokenizer, messages: list[ChatMessage]
+) -> torch.Tensor:
+    """What the processor returns: the text between two special tokens is tokenized as one string."""
+    token_ids: list[int] = []
+    for message in messages:
+        content = message["content"]
+        pending = f"{message['role']}\n"
+        token_ids.append(REGISTRY.im_start_token_id)
+        for part in (
+            [{"type": "text", "text": content}] if isinstance(content, str) else content
+        ):
+            if part["type"] == "text":
+                pending += part["text"]
+            else:
+                token_ids.extend(tokenizer.encode(pending, add_special_tokens=False))
+                token_ids.extend(
+                    [
+                        REGISTRY.vision_start_token_id,
+                        REGISTRY.image_pad_token_id,
+                        REGISTRY.vision_end_token_id,
+                    ]
+                )
+                pending = ""
+        token_ids.extend(tokenizer.encode(pending, add_special_tokens=False))
+        token_ids.extend([REGISTRY.im_end_token_id, ord("\n")])
+    token_ids.append(REGISTRY.im_start_token_id)
+    token_ids.extend(tokenizer.encode("assistant\n", add_special_tokens=False))
+    return torch.tensor(token_ids)
+
+
+def test_text_parts_that_bpe_merges_are_still_wrapped_one_by_one() -> None:
+    """A text part opening with a newline, or next to another text part, used to fail the request."""
+    tokenizer = MergingTokenizer()
+    image = {
+        "type": "image",
+        "image": Image.new("RGB", (32, 32)),
+        "resized_height": 32,
+        "resized_width": 32,
+    }
+    texts = ["\nHi.", "A.", "Be brief.", "Look.", "Be brief."]
+    messages: list[ChatMessage] = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": [{"type": "text", "text": texts[0]}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text} for text in texts[1:3]],
+        },
+        {
+            "role": "user",
+            "content": [image, *({"type": "text", "text": text} for text in texts[3:])],
+        },
+    ]
+    raw_ids = separate_text_parts(
+        processor_ids(tokenizer, messages),
+        messages,
+        tokenizer=tokenizer,
+        registry=REGISTRY,
+    )
+    raw_ids = canonicalize_message_text_inputs(
+        raw_ids, messages, tokenizer=tokenizer, registry=REGISTRY
+    )
+    token_ids, _ = assistant_aligned_tokens(
+        raw_ids, messages, tokenizer=tokenizer, registry=REGISTRY
+    )
+    payloads = []
+    for start, stop in text_boundary_spans(token_ids, registry=REGISTRY):
+        span = token_ids[start + 1 : stop].tolist()
+        payloads.append(span[: span.index(REGISTRY.text_end_token_id)])
+    assert payloads == [
+        tokenizer.encode(text, add_special_tokens=False) for text in texts
+    ]
+    assert REGISTRY.image_pad_token_id in token_ids.tolist()
+
+
 def test_generated_block_hides_everything_after_its_text_end() -> None:
     block = torch.tensor([7, REGISTRY.text_end_token_id, 8, 9])
     canonical, end = canonicalize_generated_text_block(block, registry=REGISTRY)
@@ -387,16 +487,13 @@ def scripted_session(**options: str) -> GenerationSession:
     return session
 
 
-def test_an_understanding_turn_answers_once_and_leaves_its_closing_block_uncommitted() -> (
-    None
-):
+def test_an_understanding_turn_leaves_its_closing_block_uncommitted() -> None:
     """An interleaved turn decides again after its text, so there the closing block must reach the cache."""
     understanding = scripted_session(task="mmu", assistant_prefill="<think>")
     assert understanding.step() == TextEvent(
         [REGISTRY.think_start_token_id, 101, 102, 103, 104]
     )
     assert understanding.kv_cache.commit_count == 1
-    assert understanding.step() == EndEvent()
 
     interleaved = scripted_session()
     assert interleaved.step() == TextEvent([100, 101, 102, 103, 104])

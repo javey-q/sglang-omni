@@ -10,6 +10,7 @@ from PIL import Image, ImageOps
 
 from sglang_omni.models.lumina.settings import (
     IMAGE_EDGE_FACTOR,
+    MAX_IMAGE_EDGE,
     ChatMessage,
     EngineInputs,
     ImagePart,
@@ -79,16 +80,19 @@ def native_image(image: Image.Image) -> ImagePart:
 
 
 def canonical_image(image: Image.Image, *, role: str, long_edge: int) -> ImagePart:
-    """User images are resized; generated history keeps its aligned size so it stays exact."""
+    """User images are resized; generated history keeps its aligned size so it stays exact, up to the largest edge Lumina draws."""
     image = ImageOps.exif_transpose(image).convert("RGB")
     is_aligned = not (
         image.height % IMAGE_EDGE_FACTOR or image.width % IMAGE_EDGE_FACTOR
     )
-    if role == "assistant" and is_aligned:
+    is_generated = role == "assistant" and is_aligned
+    if is_generated and max(image.height, image.width) <= MAX_IMAGE_EDGE:
         height, width = image.height, image.width
     else:
         height, width = smart_resize_shape(
-            image.height, image.width, long_edge=long_edge
+            image.height,
+            image.width,
+            long_edge=MAX_IMAGE_EDGE if is_generated else long_edge,
         )
         image = image.resize((width, height), resample=Image.Resampling.LANCZOS)
     return {

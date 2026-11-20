@@ -39,6 +39,7 @@ from sglang_omni.models.lumina.serialization import (
     message_parts,
     process_messages,
     rewrite_proxy_assistant_headers,
+    separate_text_parts,
 )
 from sglang_omni.models.lumina.settings import IMAGE_EDGE_FACTOR, ChatMessage
 
@@ -210,12 +211,14 @@ def serialized_prefix(
         device,
         should_fit_pixel_budget=is_text_route,
     )
-    raw_ids = rewrite_proxy_assistant_headers(
+    raw_ids = separate_text_parts(
         processed.input_ids[0],
         proxy_messages,
-        messages,
         tokenizer=tokenizer,
         registry=registry,
+    )
+    raw_ids = rewrite_proxy_assistant_headers(
+        raw_ids, proxy_messages, messages, tokenizer=tokenizer, registry=registry
     )
     raw_ids = insert_output_route_after_system_header(
         raw_ids, tokenizer=tokenizer, registry=registry, route_token_id=route_token_id

@@ -123,8 +123,14 @@ def create_engine_executor(
                     if isinstance(event, ImageEvent)
                     else decode_text(event.token_ids)
                 )
-                # The last allowed decision produced an event, so the turn stays open.
-                finish_reason = "length" if session.is_exhausted else None
+                if session.params.task != "interleaved":
+                    # T2I, I2I, and MMU turns end with their one output.
+                    finish_reason = "stop"
+                elif session.is_exhausted:
+                    # The last allowed decision produced an event, so the turn stays open.
+                    finish_reason = "length"
+                else:
+                    pass
         except IncompleteTextGenerationError as error:
             logger.info(f"Lumina text truncated for {payload.request_id}: {error}")
             output, finish_reason = decode_text(error.token_ids), "length"

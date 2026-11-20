@@ -189,7 +189,6 @@ class GenerationSession:
             self.generator.manual_seed(params.seed)
         self.decision_count = 0
         self.image_event_count = 0
-        self.has_answered = False
 
     @property
     def is_exhausted(self) -> bool:
@@ -208,7 +207,7 @@ class GenerationSession:
         if self.params.task == "mmu":
             return self.task_text_step()
         elif self.params.task != "interleaved":
-            return self.task_image_step()
+            return self.draw_image()
         elif self.is_exhausted:
             raise IncompleteInterleavedGenerationError(
                 "Interleaved generation exceeded max_events without <|im_end|>"
@@ -269,13 +268,8 @@ class GenerationSession:
         self.prefix = current
         return event
 
-    def task_text_step(self) -> TextEvent | EndEvent:
+    def task_text_step(self) -> TextEvent:
         """An MMU turn: its prefix already opens the one answer, and nothing reads it afterwards."""
-        if self.has_answered:
-            return EndEvent()
-        else:
-            pass
-        self.has_answered = True
         registry = self.prefix.registry
         token_ids, self.prefix = generate_text_blocks(
             self.kv_cache,
@@ -290,16 +284,8 @@ class GenerationSession:
         )
         return TextEvent(token_ids)
 
-    def task_image_step(self) -> ImageEvent | EndEvent:
-        """A T2I or I2I turn: its prefix already opens the one image, and nothing reads it afterwards."""
-        if self.image_event_count:
-            return EndEvent()
-        else:
-            self.image_event_count += 1
-            return self.draw_image()
-
     def draw_image(self) -> ImageEvent:
-        """Reveal the opened canvas and decode it."""
+        """Reveal the opened canvas and decode it; a T2I or I2I prefix already opens its one image."""
         height, width = self.params.height, self.params.width
         raw_ids = generate_image_codes(
             self.kv_cache,
